@@ -317,6 +317,7 @@ export default function SwingTracer() {
   const [aiState, setAiState] = useState("idle"); // idle | capturing | analyzing | done | error
   const [aiResult, setAiResult] = useState(null);
   const [aiError, setAiError] = useState("");
+  const [exportState, setExportState] = useState("idle"); // idle | working | done | copied
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
   });
@@ -612,6 +613,108 @@ export default function SwingTracer() {
       v.addEventListener("seeked", onSeeked);
       v.currentTime = t;
     });
+
+  const captureCanvasAt = (t, maxDim = 640) =>
+    new Promise((resolve, reject) => {
+      const v = videoRef.current;
+      const onSeeked = () => {
+        v.removeEventListener("seeked", onSeeked);
+        try {
+          const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight));
+          const c = document.createElement("canvas");
+          c.width = Math.round(v.videoWidth * scale);
+          c.height = Math.round(v.videoHeight * scale);
+          c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+          resolve(c);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      v.addEventListener("seeked", onSeeked);
+      v.currentTime = t;
+    });
+
+  const exportFrameSheet = async () => {
+    const v = videoRef.current;
+    if (!v || !duration) return;
+    v.pause();
+    const resumeT = v.currentTime;
+    setExportState("working");
+    try {
+      const marked = POSITIONS.filter((p) => markers[p.id] != null).map((p) => ({
+        label: p.label,
+        t: markers[p.id],
+      }));
+      const frames = marked.length
+        ? marked
+        : [0.02, 0.2, 0.4, 0.55, 0.7, 0.92].map((f, i) => ({
+            label: `Frame ${i + 1}`,
+            t: f * duration,
+          }));
+      const cells = [];
+      for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t, 640) });
+      v.currentTime = resumeT;
+
+      const cols = cells.length <= 4 ? 2 : 3;
+      const rows = Math.ceil(cells.length / cols);
+      const cw = cells[0].canvas.width;
+      const ch = cells[0].canvas.height;
+      const labelH = 34;
+      const pad = 6;
+      const sheet = document.createElement("canvas");
+      sheet.width = cols * cw + (cols + 1) * pad;
+      sheet.height = rows * (ch + labelH + pad) + pad;
+      const ctx = sheet.getContext("2d");
+      ctx.fillStyle = "#0C120E";
+      ctx.fillRect(0, 0, sheet.width, sheet.height);
+      cells.forEach((cell, i) => {
+        const cx = pad + (i % cols) * (cw + pad);
+        const cy = pad + Math.floor(i / cols) * (ch + labelH + pad);
+        ctx.drawImage(cell.canvas, cx, cy);
+        ctx.fillStyle = "#EDF2EA";
+        ctx.font = "600 18px ui-monospace, Menlo, monospace";
+        ctx.fillText(`${cell.label}  ·  ${fmt(cell.t)}`, cx + 6, cy + ch + 24);
+      });
+
+      const a = document.createElement("a");
+      a.href = sheet.toDataURL("image/jpeg", 0.85);
+      a.download = `swing-${view}-frames.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setExportState("done");
+    } catch (err) {
+      setExportState("idle");
+      setAiState("error");
+      setAiError("Frame export failed: " + String(err?.message || err));
+    }
+  };
+
+  const copyChatPrompt = () => {
+    const marked = POSITIONS.filter((p) => markers[p.id] != null);
+    const lines = [
+      `I'm attaching a frame sheet from one of my golf swings, filmed ${
+        view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
+      }. Frames read left to right, top to bottom, in swing order.`,
+      marked.length
+        ? `Each frame is labeled with its swing position: ${marked
+            .map((p) => `${p.label} (${fmt(markers[p.id])})`)
+            .join(", ")}.`
+        : "Frames are evenly sampled through the clip.",
+      `The clip is ${fps}fps, ${fmt(duration)} long.`,
+      "",
+      "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
+      "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
+      "Finish with 2-3 specific drills for the top-priority fault, and tell me exactly what to look for in my next video to confirm progress.",
+    ];
+    const flaggedNames = allFlagged.map((f) => f.name);
+    if (flaggedNames.length)
+      lines.push("", `Context: I've already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
+    if (notes.trim()) lines.push("", `My session notes: ${notes.trim()}`);
+    navigator.clipboard?.writeText(lines.join("\n"));
+    setExportState("copied");
+    setTimeout(() => setExportState("idle"), 2500);
+  };
 
   const runAnalysis = async () => {
     const v = videoRef.current;
@@ -1019,6 +1122,27 @@ export default function SwingTracer() {
                     ? `Using your ${POSITIONS.filter((p) => markers[p.id] != null).length} marked positions`
                     : "No positions marked — will sample 6 frames evenly"}
                 </span>
+              </div>
+            </div>
+
+            <div className="card">
+              <h4>No API key? Analyze in a chat</h4>
+              <p>
+                Download a labeled frame sheet of your marked positions, then in a Claude chat:
+                attach the image and paste the copied prompt. Same analysis, no key needed —
+                the prompt includes your camera angle, position labels, flagged faults, and notes.
+              </p>
+              <div className="row" style={{ marginTop: 10 }}>
+                <button
+                  className="btn"
+                  onClick={exportFrameSheet}
+                  disabled={!src || !duration || exportState === "working"}
+                >
+                  {exportState === "working" ? "Building sheet…" : "1 · Download frame sheet"}
+                </button>
+                <button className="btn" onClick={copyChatPrompt} disabled={!duration}>
+                  {exportState === "copied" ? "Copied ✓" : "2 · Copy chat prompt"}
+                </button>
               </div>
             </div>
 
