@@ -310,6 +310,9 @@ export default function SwingTracer() {
   const [notes, setNotes] = useState("");
   const [openFault, setOpenFault] = useState(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+  const [scrubT, setScrubT] = useState(null); // non-null while finger owns the scrubber
+  const wasPlayingRef = useRef(false);
+  const primedRef = useRef(false); // first frame painted yet?
   const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error
   const [loadMsg, setLoadMsg] = useState("");
   const fileRef = useRef(null);
@@ -346,6 +349,7 @@ export default function SwingTracer() {
     if (src && src.startsWith("blob:")) URL.revokeObjectURL(src);
     fileRef.current = f;
     triedDataUrl.current = false;
+    primedRef.current = false;
     setLoadState("loading");
     setLoadMsg(`Loading ${f.name} (${(f.size / 1048576).toFixed(1)} MB)…`);
     setSrc(URL.createObjectURL(f));
@@ -421,6 +425,26 @@ export default function SwingTracer() {
     const v = videoRef.current;
     if (v) v.playbackRate = speed;
   }, [speed, src]);
+
+  // iOS won't reliably decode the first frame until playback happens, even
+  // with a nudge seek. Muted videos may be played programmatically, so:
+  // play for one frame, pause, rewind — guarantees a painted first frame.
+  const primeFirstFrame = () => {
+    const v = videoRef.current;
+    if (!v || primedRef.current) return;
+    primedRef.current = true;
+    const p = v.play();
+    if (p && p.then) {
+      p.then(() => {
+        requestAnimationFrame(() => {
+          v.pause();
+          try { v.currentTime = 0; } catch {}
+        });
+      }).catch(() => {
+        try { v.currentTime = 0.01; } catch {} // fallback: the old nudge
+      });
+    }
+  };
 
   const onTimeUpdate = () => {
     const v = videoRef.current;
@@ -1132,14 +1156,9 @@ export default function SwingTracer() {
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
                 onTimeUpdate={onTimeUpdate}
-                onLoadedMetadata={(e) => {
-                  setDuration(e.target.duration);
-                  // Safari won't decode/paint the first frame until playback —
-                  // a tiny seek forces it to render immediately on load.
-                  try { e.target.currentTime = 0.01; } catch {}
-                }}
-                onLoadedData={() => { setLoadState("ready"); setLoadMsg(""); }}
-                onCanPlay={() => { setLoadState("ready"); setLoadMsg(""); }}
+                onLoadedMetadata={(e) => setDuration(e.target.duration)}
+                onLoadedData={() => { setLoadState("ready"); setLoadMsg(""); primeFirstFrame(); }}
+                onCanPlay={() => { setLoadState("ready"); setLoadMsg(""); primeFirstFrame(); }}
                 onError={onVideoError}
               />
               <canvas
@@ -1195,9 +1214,29 @@ export default function SwingTracer() {
                 min={0}
                 max={duration || 0}
                 step={0.001}
-                value={time}
+                value={scrubT ?? time}
                 disabled={detectState === "working"}
-                onChange={(e) => seek(parseFloat(e.target.value))}
+                onPointerDown={() => {
+                  const v = videoRef.current;
+                  wasPlayingRef.current = !!(v && !v.paused);
+                  if (v) v.pause();
+                  setScrubT(videoRef.current?.currentTime ?? time);
+                }}
+                onChange={(e) => {
+                  const t = parseFloat(e.target.value);
+                  setScrubT(t);
+                  seek(t);
+                }}
+                onPointerUp={() => {
+                  setScrubT(null);
+                  const v = videoRef.current;
+                  if (wasPlayingRef.current && v && detectState !== "working") {
+                    v.playbackRate = speed;
+                    v.play();
+                  }
+                  wasPlayingRef.current = false;
+                }}
+                onPointerCancel={() => { setScrubT(null); wasPlayingRef.current = false; }}
               />
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div className="row">
