@@ -395,7 +395,7 @@ export default function SwingTracer() {
 
   const togglePlay = () => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || detectState === "working") return;
     if (v.paused) {
       v.playbackRate = speed;
       v.play();
@@ -404,7 +404,7 @@ export default function SwingTracer() {
 
   const step = (dir) => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || detectState === "working") return;
     v.pause();
     v.currentTime = Math.min(Math.max(0, v.currentTime + dir / fps), duration || 0);
   };
@@ -626,18 +626,35 @@ export default function SwingTracer() {
   /* ---------- auto position detection (motion energy) ---------- */
 
   // Seek, then wait until the new frame is actually painted before capturing.
-  // iOS Safari can fire 'seeked' before the frame is decoded, which silently
-  // captures stale pixels — requestVideoFrameCallback closes that gap.
+  // iOS Safari can fire 'seeked' before the frame is decoded (stale pixels),
+  // but requestVideoFrameCallback may never fire on a paused video, and
+  // seeking to the current time fires no 'seeked' at all. So: short-circuit
+  // same-time seeks, take the frame callback when it comes, and backstop
+  // everything with timeouts so no sample can ever hang.
   const seekAndPaint = (v, t) =>
     new Promise((resolve) => {
-      const onSeeked = () => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
         v.removeEventListener("seeked", onSeeked);
+        clearTimeout(backstop);
+        resolve();
+      };
+      const onSeeked = () => {
         if ("requestVideoFrameCallback" in v) {
-          v.requestVideoFrameCallback(() => resolve());
+          v.requestVideoFrameCallback(() => finish());
+          setTimeout(finish, 120); // rVFC can stay silent on paused video
         } else {
-          setTimeout(resolve, 50);
+          setTimeout(finish, 50);
         }
       };
+      const backstop = setTimeout(finish, 500); // absolute: never hang
+      if (Math.abs((v.currentTime || 0) - t) < 0.001) {
+        // no seek will occur — the displayed frame is already the right one
+        requestAnimationFrame(() => requestAnimationFrame(finish));
+        return;
+      }
       v.addEventListener("seeked", onSeeked);
       v.currentTime = t;
     });
@@ -673,9 +690,16 @@ export default function SwingTracer() {
         for (let p = 0; p < a.length; p += 4) sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
         return sum / (a.length / 4);
       };
+      // if playback somehow starts mid-detection, stop cleanly instead of fighting it
+      const assertPaused = () => {
+        const vv = videoRef.current;
+        if (!vv || !vv.paused) throw new Error("DETECT_CANCELLED");
+      };
+
       let prev = null;
       const motion = [];
       for (let i = 0; i < N; i++) {
+        assertPaused();
         const data = await sampleLuma(times[i], W, H, ctx);
         motion.push(prev ? diffOf(data, prev) : 0);
         prev = data;
@@ -724,6 +748,7 @@ export default function SwingTracer() {
         );
         let prevD = null, best = { t: centerT, m: wantMax ? -1 : Infinity };
         for (const t of ts) {
+          assertPaused();
           const d = await sampleLuma(t, W, H, ctx);
           if (prevD) {
             const m = diffOf(d, prevD);
@@ -789,8 +814,13 @@ export default function SwingTracer() {
           preservedNote
       );
     } catch (err) {
-      setDetectState("warn");
-      setDetectMsg("Detection failed: " + String(err?.message || err) + ". Mark positions manually.");
+      if (String(err?.message).includes("DETECT_CANCELLED")) {
+        setDetectState("idle");
+        setDetectMsg("Detection stopped — the video started playing mid-scan. Pause and tap ⚡ Auto-detect again.");
+      } else {
+        setDetectState("warn");
+        setDetectMsg("Detection failed: " + String(err?.message || err) + ". Mark positions manually.");
+      }
       if (videoRef.current) videoRef.current.currentTime = resumeT;
     }
   };
@@ -1138,13 +1168,16 @@ export default function SwingTracer() {
                 max={duration || 0}
                 step={0.001}
                 value={time}
+                disabled={detectState === "working"}
                 onChange={(e) => seek(parseFloat(e.target.value))}
               />
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div className="row">
-                  <button className="btn" onClick={() => step(-1)}>⏮ Frame</button>
-                  <button className="btn primary" onClick={togglePlay}>{playing ? "Pause" : "Play"}</button>
-                  <button className="btn" onClick={() => step(1)}>Frame ⏭</button>
+                  <button className="btn" onClick={() => step(-1)} disabled={detectState === "working"}>⏮ Frame</button>
+                  <button className="btn primary" onClick={togglePlay} disabled={detectState === "working"}>
+                    {detectState === "working" ? "Detecting…" : playing ? "Pause" : "Play"}
+                  </button>
+                  <button className="btn" onClick={() => step(1)} disabled={detectState === "working"}>Frame ⏭</button>
                 </div>
                 <span className="mono" style={{ fontSize: 13, color: "var(--amber)" }}>
                   {fmt(time)} / {fmt(duration)}
