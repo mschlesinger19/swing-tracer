@@ -601,59 +601,53 @@ export default function SwingTracer() {
 
   /* ---------- Claude analysis ---------- */
 
-  const captureFrame = (t) =>
-    new Promise((resolve, reject) => {
-      const v = videoRef.current;
-      const onSeeked = () => {
-        v.removeEventListener("seeked", onSeeked);
-        try {
-          const scale = Math.min(1, 768 / Math.max(v.videoWidth, v.videoHeight));
-          const c = document.createElement("canvas");
-          c.width = Math.round(v.videoWidth * scale);
-          c.height = Math.round(v.videoHeight * scale);
-          c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-          resolve(c.toDataURL("image/jpeg", 0.7).split(",")[1]);
-        } catch (err) {
-          reject(err);
-        }
-      };
-      v.addEventListener("seeked", onSeeked);
-      v.currentTime = t;
-    });
+  const captureFrame = async (t) => {
+    const v = videoRef.current;
+    await seekAndPaint(v, t);
+    const scale = Math.min(1, 768 / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.round(v.videoWidth * scale);
+    c.height = Math.round(v.videoHeight * scale);
+    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", 0.7).split(",")[1];
+  };
 
-  const captureCanvasAt = (t, maxDim = 640) =>
-    new Promise((resolve, reject) => {
-      const v = videoRef.current;
-      const onSeeked = () => {
-        v.removeEventListener("seeked", onSeeked);
-        try {
-          const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight));
-          const c = document.createElement("canvas");
-          c.width = Math.round(v.videoWidth * scale);
-          c.height = Math.round(v.videoHeight * scale);
-          c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-          resolve(c);
-        } catch (err) {
-          reject(err);
-        }
-      };
-      v.addEventListener("seeked", onSeeked);
-      v.currentTime = t;
-    });
+  const captureCanvasAt = async (t, maxDim = 640) => {
+    const v = videoRef.current;
+    await seekAndPaint(v, t);
+    const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.round(v.videoWidth * scale);
+    c.height = Math.round(v.videoHeight * scale);
+    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+    return c;
+  };
 
   /* ---------- auto position detection (motion energy) ---------- */
 
-  const sampleLuma = (t, w, h, ctx) =>
+  // Seek, then wait until the new frame is actually painted before capturing.
+  // iOS Safari can fire 'seeked' before the frame is decoded, which silently
+  // captures stale pixels — requestVideoFrameCallback closes that gap.
+  const seekAndPaint = (v, t) =>
     new Promise((resolve) => {
-      const v = videoRef.current;
       const onSeeked = () => {
         v.removeEventListener("seeked", onSeeked);
-        ctx.drawImage(v, 0, 0, w, h);
-        resolve(ctx.getImageData(0, 0, w, h).data);
+        if ("requestVideoFrameCallback" in v) {
+          v.requestVideoFrameCallback(() => resolve());
+        } else {
+          setTimeout(resolve, 50);
+        }
       };
       v.addEventListener("seeked", onSeeked);
       v.currentTime = t;
     });
+
+  const sampleLuma = async (t, w, h, ctx) => {
+    const v = videoRef.current;
+    await seekAndPaint(v, t);
+    ctx.drawImage(v, 0, 0, w, h);
+    return ctx.getImageData(0, 0, w, h).data;
+  };
 
   const autoDetect = async () => {
     const v = videoRef.current;
@@ -751,22 +745,48 @@ export default function SwingTracer() {
         found.p6 = p4T + 0.75 * (p7T - p4T); // interpolated
       }
 
-      // confidence: strong impact peak, deep top valley, sane ordering
+      // validity: a real swing means the top and finish frames look very
+      // different from address. If they don't, we found a waggle, not a swing.
       const med = [...sm].sort((a, b) => a - b)[Math.floor(sm.length / 2)];
+      const fAddr = await sampleLuma(p1T, W, H, ctx);
+      const fTop = await sampleLuma(found.p4 ?? (p1T + p7T) / 2, W, H, ctx);
+      const fFin = await sampleLuma(Math.max(p10T - 0.05, p7T), W, H, ctx);
+      const noiseFloor = Math.max(1e-6, med);
+      const swingVisible =
+        diffOf(fAddr, fTop) > 3 * noiseFloor || diffOf(fAddr, fFin) > 3 * noiseFloor;
+
       const confident =
-        peakVal / Math.max(1e-6, med) > 3 &&
+        swingVisible &&
+        peakVal / noiseFloor > 3 &&
         found.p4 != null &&
         p1T < found.p4 && found.p4 < p7T && p7T < p10T &&
         p4Val < peakVal * 0.6;
 
-      setMarkers((m) => ({ ...m, ...found }));
-      setSuggested(Object.keys(found).reduce((acc, k) => ({ ...acc, [k]: true }), {}));
-      v.currentTime = found.p7;
+      // never overwrite a confirmed manual mark — only fill empty or still-suggested chips
+      const keepManual = (k) => markers[k] != null && !suggested[k];
+      const applied = {};
+      Object.entries(found).forEach(([k, t]) => {
+        if (!keepManual(k)) applied[k] = t;
+      });
+      const preservedCount = Object.keys(found).length - Object.keys(applied).length;
+
+      setMarkers((m) => ({ ...m, ...applied }));
+      setSuggested((s) => ({
+        ...s,
+        ...Object.keys(applied).reduce((acc, k) => ({ ...acc, [k]: true }), {}),
+      }));
+      v.currentTime = applied.p7 ?? markers.p7 ?? found.p7;
       setDetectState(confident ? "done" : "warn");
+      const preservedNote = preservedCount
+        ? ` Kept ${preservedCount} manually confirmed mark${preservedCount > 1 ? "s" : ""} untouched.`
+        : "";
       setDetectMsg(
-        confident
+        (!swingVisible
+          ? "⚠ These are probably wrong — the frames at the detected top and finish look identical to address, which means I found pre-shot movement (a waggle or regrip), not the swing. Scrub the timeline: if the swing is in the clip, note where impact is and trim the dead time before re-detecting; if the clip ends before the swing, re-export it."
+          : confident
           ? "Positions suggested (amber = unconfirmed). Tap a chip to jump there, frame-step to check, and re-mark anything that's off — P2 and P6 are interpolated, so eyeball those two especially."
-          : "⚠ Low confidence — the motion pattern looked unusual (camera shake, a waggle, or movement in the background). Best guesses are placed, but double-check every chip before exporting or analyzing."
+          : "⚠ Low confidence — the motion pattern looked unusual (camera shake, a waggle, or movement in the background). Best guesses are placed, but double-check every chip before exporting or analyzing.") +
+          preservedNote
       );
     } catch (err) {
       setDetectState("warn");
