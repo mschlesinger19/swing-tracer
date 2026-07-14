@@ -320,6 +320,7 @@ export default function SwingTracer() {
   const [exportState, setExportState] = useState("idle"); // idle | working | done | copied
   const [detectState, setDetectState] = useState("idle"); // idle | working | done | warn
   const [detectMsg, setDetectMsg] = useState("");
+  const [detectTrace, setDetectTrace] = useState(null); // motion curve + placements for debugging
   const [suggested, setSuggested] = useState({}); // position ids that are auto-detected, not yet confirmed
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
@@ -354,6 +355,7 @@ export default function SwingTracer() {
     setSuggested({});
     setDetectState("idle");
     setDetectMsg("");
+    setDetectTrace(null);
     setPlaying(false);
     setTime(0);
   };
@@ -574,7 +576,9 @@ export default function SwingTracer() {
 
   const tapMarker = (id) => {
     if (markMode) {
-      setMarkers((m) => ({ ...m, [id]: videoRef.current?.currentTime ?? 0 }));
+      const v = videoRef.current;
+      if (v && !v.paused) v.pause(); // stamp the frame you're looking at, not one later
+      setMarkers((m) => ({ ...m, [id]: v?.currentTime ?? 0 }));
       setSuggested((s) => ({ ...s, [id]: false }));
     } else if (markers[id] != null) {
       seek(markers[id]);
@@ -625,36 +629,44 @@ export default function SwingTracer() {
 
   /* ---------- auto position detection (motion energy) ---------- */
 
-  // Seek, then wait until the new frame is actually painted before capturing.
-  // iOS Safari can fire 'seeked' before the frame is decoded (stale pixels),
-  // but requestVideoFrameCallback may never fire on a paused video, and
-  // seeking to the current time fires no 'seeked' at all. So: short-circuit
-  // same-time seeks, take the frame callback when it comes, and backstop
-  // everything with timeouts so no sample can ever hang.
+  // Seek, then wait until the *correct* frame is painted before capturing.
+  // The frame callback reports the mediaTime of the frame it painted, so we
+  // verify it matches the seek target — a stale frame just means we wait for
+  // the next paint. Grace + backstop timers guarantee this can never hang,
+  // and same-time seeks short-circuit (they fire no 'seeked' event at all).
   const seekAndPaint = (v, t) =>
     new Promise((resolve) => {
       let settled = false;
+      let vfcHandle = null;
+      let grace = null;
       const finish = () => {
         if (settled) return;
         settled = true;
         v.removeEventListener("seeked", onSeeked);
+        if (vfcHandle != null && "cancelVideoFrameCallback" in v) v.cancelVideoFrameCallback(vfcHandle);
         clearTimeout(backstop);
+        clearTimeout(grace);
         resolve();
       };
-      const onSeeked = () => {
-        if ("requestVideoFrameCallback" in v) {
-          v.requestVideoFrameCallback(() => finish());
-          setTimeout(finish, 120); // rVFC can stay silent on paused video
-        } else {
-          setTimeout(finish, 50);
+      const onFrame = (_now, meta) => {
+        vfcHandle = null;
+        if (settled) return;
+        if (meta && Math.abs(meta.mediaTime - t) < 0.2) {
+          finish(); // painted frame verified as the target
+        } else if ("requestVideoFrameCallback" in v) {
+          vfcHandle = v.requestVideoFrameCallback(onFrame); // stale — wait for next paint
         }
       };
-      const backstop = setTimeout(finish, 500); // absolute: never hang
+      const onSeeked = () => {
+        // fallback path if frame callbacks stay silent: give decode a beat
+        grace = setTimeout(finish, 200);
+      };
+      const backstop = setTimeout(finish, 900); // absolute: never hang
       if (Math.abs((v.currentTime || 0) - t) < 0.001) {
-        // no seek will occur — the displayed frame is already the right one
         requestAnimationFrame(() => requestAnimationFrame(finish));
         return;
       }
+      if ("requestVideoFrameCallback" in v) vfcHandle = v.requestVideoFrameCallback(onFrame);
       v.addEventListener("seeked", onSeeked);
       v.currentTime = t;
     });
@@ -802,6 +814,15 @@ export default function SwingTracer() {
       }));
       v.currentTime = applied.p7 ?? markers.p7 ?? found.p7;
       setDetectState(confident ? "done" : "warn");
+      setDetectTrace({
+        times,
+        sm,
+        peakVal,
+        quiet,
+        settle: peakVal * 0.18,
+        found,
+        stats: `peak ${(peakVal / noiseFloor).toFixed(1)}× median · impact ${fmt(p7T)} · top ${found.p4 != null ? fmt(found.p4) : "—"} · finish ${fmt(p10T)}${swingVisible ? "" : " · swing NOT visually confirmed"}`,
+      });
       const preservedNote = preservedCount
         ? ` Kept ${preservedCount} manually confirmed mark${preservedCount > 1 ? "s" : ""} untouched.`
         : "";
@@ -1107,11 +1128,18 @@ export default function SwingTracer() {
                 src={src}
                 playsInline
                 muted
+                preload="auto"
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
                 onTimeUpdate={onTimeUpdate}
-                onLoadedMetadata={(e) => setDuration(e.target.duration)}
+                onLoadedMetadata={(e) => {
+                  setDuration(e.target.duration);
+                  // Safari won't decode/paint the first frame until playback —
+                  // a tiny seek forces it to render immediately on load.
+                  try { e.target.currentTime = 0.01; } catch {}
+                }}
                 onLoadedData={() => { setLoadState("ready"); setLoadMsg(""); }}
+                onCanPlay={() => { setLoadState("ready"); setLoadMsg(""); }}
                 onError={onVideoError}
               />
               <canvas
@@ -1234,6 +1262,45 @@ export default function SwingTracer() {
             {detectMsg && detectState !== "working" && (
               <div className="card" style={{ borderColor: detectState === "warn" ? "var(--amber)" : "var(--edge)" }}>
                 <p style={{ margin: 0, color: detectState === "warn" ? "var(--amber)" : "var(--muted)" }}>{detectMsg}</p>
+                {detectTrace && (
+                  <div style={{ marginTop: 10 }}>
+                    <svg
+                      viewBox="0 0 300 84"
+                      preserveAspectRatio="none"
+                      style={{ width: "100%", height: 84, display: "block", background: "var(--panel2)", borderRadius: 8 }}
+                    >
+                      {/* threshold lines */}
+                      <line x1="0" x2="300" y1={80 - (detectTrace.quiet / detectTrace.peakVal) * 72} y2={80 - (detectTrace.quiet / detectTrace.peakVal) * 72} stroke="#4A5850" strokeDasharray="3,3" strokeWidth="1" />
+                      <line x1="0" x2="300" y1={80 - (detectTrace.settle / detectTrace.peakVal) * 72} y2={80 - (detectTrace.settle / detectTrace.peakVal) * 72} stroke="#4A5850" strokeDasharray="1,3" strokeWidth="1" />
+                      {/* motion curve */}
+                      <polyline
+                        fill="none"
+                        stroke="#8FA096"
+                        strokeWidth="1.5"
+                        points={detectTrace.sm
+                          .map((v, i) => `${(detectTrace.times[i] / (duration || 1)) * 300},${80 - (v / detectTrace.peakVal) * 72}`)
+                          .join(" ")}
+                      />
+                      {/* placements */}
+                      {Object.entries(detectTrace.found).map(([id, t]) => {
+                        const colors = { p1: "#55C97B", p2: "#8FA096", p4: "#4DA3FF", p6: "#8FA096", p7: "#FF5A36", p10: "#FFB020" };
+                        const x = (t / (duration || 1)) * 300;
+                        return (
+                          <g key={id}>
+                            <line x1={x} x2={x} y1="10" y2="80" stroke={colors[id]} strokeWidth="1.5" />
+                            <text x={x + 2} y="9" fill={colors[id]} fontSize="8" fontFamily="monospace">{id.toUpperCase()}</text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                    <p className="hint mono" style={{ marginTop: 6, fontSize: 11 }}>
+                      {detectTrace.stats}
+                    </p>
+                    <p className="hint" style={{ marginTop: 2 }}>
+                      Motion trace — what detection saw. Dashed lines: quiet + settle thresholds. If a position looks wrong, screenshot this.
+                    </p>
+                  </div>
+                )}
                 {Object.values(suggested).some(Boolean) && (
                   <div className="row" style={{ marginTop: 8, justifyContent: "flex-end" }}>
                     <button
