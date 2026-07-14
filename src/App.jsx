@@ -318,6 +318,9 @@ export default function SwingTracer() {
   const [aiResult, setAiResult] = useState(null);
   const [aiError, setAiError] = useState("");
   const [exportState, setExportState] = useState("idle"); // idle | working | done | copied
+  const [detectState, setDetectState] = useState("idle"); // idle | working | done | warn
+  const [detectMsg, setDetectMsg] = useState("");
+  const [suggested, setSuggested] = useState({}); // position ids that are auto-detected, not yet confirmed
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
   });
@@ -348,6 +351,9 @@ export default function SwingTracer() {
     setShapes([]);
     setAnglePts([]);
     setMarkers({});
+    setSuggested({});
+    setDetectState("idle");
+    setDetectMsg("");
     setPlaying(false);
     setTime(0);
   };
@@ -569,6 +575,7 @@ export default function SwingTracer() {
   const tapMarker = (id) => {
     if (markMode) {
       setMarkers((m) => ({ ...m, [id]: videoRef.current?.currentTime ?? 0 }));
+      setSuggested((s) => ({ ...s, [id]: false }));
     } else if (markers[id] != null) {
       seek(markers[id]);
     }
@@ -633,6 +640,140 @@ export default function SwingTracer() {
       v.addEventListener("seeked", onSeeked);
       v.currentTime = t;
     });
+
+  /* ---------- auto position detection (motion energy) ---------- */
+
+  const sampleLuma = (t, w, h, ctx) =>
+    new Promise((resolve) => {
+      const v = videoRef.current;
+      const onSeeked = () => {
+        v.removeEventListener("seeked", onSeeked);
+        ctx.drawImage(v, 0, 0, w, h);
+        resolve(ctx.getImageData(0, 0, w, h).data);
+      };
+      v.addEventListener("seeked", onSeeked);
+      v.currentTime = t;
+    });
+
+  const autoDetect = async () => {
+    const v = videoRef.current;
+    if (!v || !duration) return;
+    v.pause();
+    const resumeT = v.currentTime;
+    setDetectState("working");
+    setDetectMsg("Scanning motion…");
+    try {
+      const W = 96;
+      const H = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * W) || 54);
+      const c = document.createElement("canvas");
+      c.width = W;
+      c.height = H;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+
+      // coarse pass: build the motion curve
+      const N = Math.min(72, Math.max(36, Math.round(duration * 12)));
+      const end = Math.max(0.01, duration - 0.01);
+      const times = Array.from({ length: N }, (_, i) => (i / (N - 1)) * end);
+      const diffOf = (a, b) => {
+        let sum = 0;
+        for (let p = 0; p < a.length; p += 4) sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
+        return sum / (a.length / 4);
+      };
+      let prev = null;
+      const motion = [];
+      for (let i = 0; i < N; i++) {
+        const data = await sampleLuma(times[i], W, H, ctx);
+        motion.push(prev ? diffOf(data, prev) : 0);
+        prev = data;
+      }
+      motion[0] = motion[1] || 0;
+
+      // light smoothing
+      const sm = motion.map((_, i) => {
+        const a = Math.max(0, i - 1), b = Math.min(motion.length - 1, i + 1);
+        let s = 0;
+        for (let j = a; j <= b; j++) s += motion[j];
+        return s / (b - a + 1);
+      });
+
+      const peakVal = Math.max(...sm);
+      const peakIdx = sm.indexOf(peakVal);
+      const quiet = peakVal * 0.12;
+
+      // P4: deepest valley before impact (skip the very start)
+      let p4Idx = -1, p4Val = Infinity;
+      for (let i = Math.max(1, Math.floor(peakIdx * 0.25)); i < peakIdx; i++) {
+        if (sm[i] < p4Val) { p4Val = sm[i]; p4Idx = i; }
+      }
+
+      // P1: last quiet frame before sustained motion begins
+      let p1Idx = 0;
+      const stopAt = p4Idx > 0 ? p4Idx : peakIdx;
+      for (let i = 0; i < stopAt; i++) {
+        if (sm[i] <= quiet) p1Idx = i;
+        else if (sm[i] > peakVal * 0.3 && i > 2) break;
+      }
+
+      // P10: motion settles after impact
+      let p10Idx = N - 1;
+      for (let i = peakIdx + 2; i < N - 1; i++) {
+        if (sm[i] < peakVal * 0.18 && sm[i + 1] < peakVal * 0.18) { p10Idx = i; break; }
+      }
+
+      // fine passes around impact (max motion) and top (min motion)
+      setDetectMsg("Refining impact and top…");
+      const stepT = times[1] - times[0];
+      const finePass = async (centerT, wantMax) => {
+        const S = 9;
+        const ts = Array.from({ length: S }, (_, i) =>
+          Math.min(Math.max(0, centerT - stepT + (i / (S - 1)) * 2 * stepT), end)
+        );
+        let prevD = null, best = { t: centerT, m: wantMax ? -1 : Infinity };
+        for (const t of ts) {
+          const d = await sampleLuma(t, W, H, ctx);
+          if (prevD) {
+            const m = diffOf(d, prevD);
+            if (wantMax ? m > best.m : m < best.m) best = { t, m };
+          }
+          prevD = d;
+        }
+        return best.t;
+      };
+      const p7T = await finePass(times[peakIdx], true);
+      const p4T = p4Idx > 0 ? await finePass(times[p4Idx], false) : null;
+
+      const p1T = times[p1Idx];
+      const p10T = times[p10Idx];
+      const found = { p1: p1T, p7: p7T, p10: p10T };
+      if (p4T != null && p4T > p1T && p4T < p7T) {
+        found.p4 = p4T;
+        found.p2 = p1T + 0.45 * (p4T - p1T); // interpolated
+        found.p6 = p4T + 0.75 * (p7T - p4T); // interpolated
+      }
+
+      // confidence: strong impact peak, deep top valley, sane ordering
+      const med = [...sm].sort((a, b) => a - b)[Math.floor(sm.length / 2)];
+      const confident =
+        peakVal / Math.max(1e-6, med) > 3 &&
+        found.p4 != null &&
+        p1T < found.p4 && found.p4 < p7T && p7T < p10T &&
+        p4Val < peakVal * 0.6;
+
+      setMarkers((m) => ({ ...m, ...found }));
+      setSuggested(Object.keys(found).reduce((acc, k) => ({ ...acc, [k]: true }), {}));
+      v.currentTime = found.p7;
+      setDetectState(confident ? "done" : "warn");
+      setDetectMsg(
+        confident
+          ? "Positions suggested (amber = unconfirmed). Tap a chip to jump there, frame-step to check, and re-mark anything that's off — P2 and P6 are interpolated, so eyeball those two especially."
+          : "⚠ Low confidence — the motion pattern looked unusual (camera shake, a waggle, or movement in the background). Best guesses are placed, but double-check every chip before exporting or analyzing."
+      );
+    } catch (err) {
+      setDetectState("warn");
+      setDetectMsg("Detection failed: " + String(err?.message || err) + ". Mark positions manually.");
+      if (videoRef.current) videoRef.current.currentTime = resumeT;
+    }
+  };
 
   const exportFrameSheet = async () => {
     const v = videoRef.current;
@@ -850,6 +991,8 @@ export default function SwingTracer() {
         .chip { border:1px solid var(--edge); background:var(--panel); color:var(--muted); border-radius:999px; padding:6px 11px; font-size:12px; font-weight:600; cursor:pointer; }
         .chip.set { color:var(--chalk); border-color:var(--green); }
         .chip.set .t { color:var(--green); }
+        .chip.sug { color:var(--chalk); border-color:var(--amber); }
+        .chip.sug .t { color:var(--amber); }
         .dot { width:22px; height:22px; border-radius:50%; border:2px solid transparent; cursor:pointer; }
         .dot.on { border-color:var(--chalk); }
         .tabs { display:flex; gap:2px; margin-top:18px; border-bottom:1px solid var(--edge); }
@@ -1011,17 +1154,45 @@ export default function SwingTracer() {
             {/* position markers */}
             <div className="row" style={{ marginTop: 12, justifyContent: "space-between" }}>
               <span className="st-eyebrow" style={{ color: "var(--green)" }}>Positions</span>
-              <button className={`btn small ${markMode ? "on" : ""}`} onClick={() => setMarkMode(!markMode)}>
-                {markMode ? "Marking: tap a chip to stamp this frame" : "✎ Mark positions"}
-              </button>
+              <div className="row">
+                <button
+                  className="btn small"
+                  onClick={autoDetect}
+                  disabled={detectState === "working"}
+                >
+                  {detectState === "working" ? "Detecting…" : "⚡ Auto-detect"}
+                </button>
+                <button className={`btn small ${markMode ? "on" : ""}`} onClick={() => setMarkMode(!markMode)}>
+                  {markMode ? "Marking: tap a chip to stamp this frame" : "✎ Mark positions"}
+                </button>
+              </div>
             </div>
             <div className="chips">
               {POSITIONS.map((p) => (
-                <button key={p.id} className={`chip ${markers[p.id] != null ? "set" : ""}`} onClick={() => tapMarker(p.id)}>
+                <button
+                  key={p.id}
+                  className={`chip ${markers[p.id] != null ? (suggested[p.id] ? "sug" : "set") : ""}`}
+                  onClick={() => tapMarker(p.id)}
+                >
                   {p.label}{markers[p.id] != null && <span className="t mono"> {fmt(markers[p.id])}</span>}
                 </button>
               ))}
             </div>
+            {detectMsg && detectState !== "working" && (
+              <div className="card" style={{ borderColor: detectState === "warn" ? "var(--amber)" : "var(--edge)" }}>
+                <p style={{ margin: 0, color: detectState === "warn" ? "var(--amber)" : "var(--muted)" }}>{detectMsg}</p>
+                {Object.values(suggested).some(Boolean) && (
+                  <div className="row" style={{ marginTop: 8, justifyContent: "flex-end" }}>
+                    <button
+                      className="btn small"
+                      onClick={() => { setSuggested({}); setDetectMsg(""); setDetectState("idle"); }}
+                    >
+                      ✓ Looks good — confirm all
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </>
         )}
 
