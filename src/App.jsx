@@ -709,6 +709,15 @@ export default function SwingTracer() {
     return sum / (a.length / 4);
   };
 
+  // fraction of pixels whose |ΔR|+|ΔB| exceeds a per-pixel threshold — the
+  // near-identical test for the dedupe pass in getExportFrames. See rule 7
+  // there for why this beats the mean diff for that job.
+  const changedFracOf = (a, b) => {
+    let n = 0;
+    for (let p = 0; p < a.length; p += 4) if (Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]) > 40) n++;
+    return n / (a.length / 4);
+  };
+
   // Shared frame selection for the downloadable frame sheet, the chat-export
   // prompt, and the AI Coach direct-analysis path. History of this function:
   // pure content-driven selection missed impact (motion blur suppresses
@@ -719,7 +728,15 @@ export default function SwingTracer() {
   //  1. motion peak is only a SEARCH HINT for impact
   //  2. impact refined by ball-departure: find the static-early/changed-late
   //     region (the ball on its tee), then locate the frame boundary where
-  //     it leaves; motion peak used alone only when no ball is detectable
+  //     it leaves; motion peak used alone only when no ball is detectable.
+  //     The departure must be TRAILING — the >half run has to reach the end
+  //     of the search window, because the ball never comes back but a
+  //     shadow or the club crossing the ROI departs and returns (a shadow
+  //     crossing was accepted as impact by the old 3-consecutive-samples
+  //     rule on a real clip). The window spans peak−0.5s → peak+0.35s:
+  //     peak errors usually skew late, but on low-contrast clips the peak
+  //     can fire early too (takeaway ≈ downswing at 96px), and the old
+  //     peak+0.1s end sometimes didn't even contain impact.
   //  3. dense sampling window is ASYMMETRIC around the estimate
   //     (impact−0.35s → impact+0.05s) since errors skew late
   //  4. ≤3 frames after estimated impact (release / mid / finish) — the
@@ -728,20 +745,30 @@ export default function SwingTracer() {
   //     when every estimate above is wrong: no gap >0.10s inside the
   //     40–85% region of the marked window, no gap >25% of the window
   //     anywhere, ≥12 frames; results of these checks logged per sheet.
-  //     When impact is BALL-CONFIRMED the 0.10s core region ends at impact
-  //     instead of 85% — the unconditional version re-inserted the exact
-  //     follow-through frames rule 4 had removed whenever impact fell
-  //     inside the 40-85% band (observed: 7 post-impact frames on a sheet
-  //     whose impact sat at 68% of the window). Low-trust estimates keep
-  //     the full 40-85% safety net, so the post-impact cap is best-effort
-  //     only in that case.
+  //     When the ball-departure and motion-peak estimates AGREE (±0.08s)
+  //     the 0.10s core region ends at impact instead of 85% — the
+  //     unconditional version re-inserted the exact follow-through frames
+  //     rule 4 had removed whenever impact fell inside the 40-85% band
+  //     (observed: 7 post-impact frames on a sheet whose impact sat at 68%
+  //     of the window). Agreement is required because a false ROI can pass
+  //     every departure filter (observed: the golfer's legs — static in
+  //     the backswing, permanently shifted once the downswing starts —
+  //     "departed" 0.23s before real impact; shrinking coverage around
+  //     that estimate would have opened a hole over the true delivery).
+  //     Unconfirmed estimates keep the full 40-85% safety net, so the
+  //     post-impact cap is best-effort only in that case.
   //  6. every timestamp snapped to a real source frame at the declared fps
   //  7. visually-static dedupe: a selected frame nearly pixel-identical to
   //     the previously kept one is dropped (the club hovers at the top, so
   //     time-uniform dense sampling bought 5 duplicate top-of-backswing
-  //     frames). Identical pixels are proof no action was missed, so these
-  //     gaps are exempt from the 0.10s core rule — but never the impact
-  //     frame or an endpoint, and the global 25% ceiling still applies
+  //     frames). Near-identical is judged by the FRACTION of changed
+  //     pixels, not the mean diff — compression noise moves many pixels a
+  //     little, a moving club moves few pixels a lot (measured: hover
+  //     pairs ≤0.5% changed vs ≥1.1% on real motion, where the mean
+  //     overlapped). Identical pixels are proof no action was missed, so
+  //     these gaps are exempt from the 0.10s core rule — but never the
+  //     impact frame or an endpoint, and the global 25% ceiling still
+  //     applies
   //  8. budget freed by 4+7 is spent on the takeaway (start → dense
   //     window), splitting gaps >0.30s — previously ~0.5s takeaway gaps
   //     left no shaft-parallel-back frame
@@ -826,34 +853,30 @@ export default function SwingTracer() {
     // ---- pass 3: ball-departure search. Window skews EARLY of the motion
     // peak because peak errors skew late (follow-through dominates motion).
     let impactT = peakT;
-    let impactTrusted = false; // true only when ball-departure confirms the estimate
+    let impactTrusted = false; // earned only when two independent estimates agree — see rule 5
     let impactMethod = `motion peak only (no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
     if (ball) {
       const sStart = Math.max(start, peakT - 0.5);
-      const sEnd = Math.min(end, peakT + 0.1);
+      const sEnd = Math.min(end, peakT + 0.35);
       const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
       const half = ball.lateChange * 0.5;
-      let found = null;
-      let run = 0;
+      // trailing-run rule (rule 2): impact = start of the departed run that
+      // reaches the window end; transient crossings depart and return
+      const curve = [];
       for (let t = sStart; t <= sEnd + 1e-6; t += step) {
         const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
-        const d = avgBlockDiff(f, earlyMean, ball.bx, ball.by);
-        if (d > half) {
-          run++;
-          if (run === 1) found = snap(t);
-          if (run >= 3) break; // departed and stayed departed — that's impact
-        } else {
-          run = 0;
-          found = null;
-        }
+        curve.push([snap(t), avgBlockDiff(f, earlyMean, ball.bx, ball.by)]);
       }
-      if (found != null && run >= 3) {
+      let runStart = -1;
+      for (let i = curve.length - 1; i >= 0 && curve[i][1] > half; i--) runStart = i;
+      if (runStart !== -1 && curve.length - runStart >= 3) {
+        const found = curve[runStart][0];
         const delta = peakT - found;
         impactT = found;
-        impactTrusted = true;
+        impactTrusted = Math.abs(delta) <= 0.08;
         impactMethod =
           `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
-          (Math.abs(delta) > 0.06 ? "rejected" : "agreed");
+          (impactTrusted ? "agreed" : "away — unconfirmed, coverage safety rules kept");
       }
     }
 
@@ -929,7 +952,7 @@ export default function SwingTracer() {
     // hover lasts ~0.3-0.4s and collapsing it entirely hides how long the
     // club sat there; a bookend every ≤0.2s keeps ~2 frames at the top,
     // which is the budget the analysis actually wants spent there.
-    const DEDUPE_THRESH = Math.max(1.5, 0.45 * scanMedian);
+    const DEDUPE_THRESH = 0.007; // <0.7% of pixels changed = visually static
     const lumaAt = new Map();
     for (const t of times) lumaAt.set(t, await sampleLuma(t, lo.w, lo.h, lo.ctx));
     const staticSpans = []; // [a, b] gaps whose dropped interior frames all matched a
@@ -946,7 +969,7 @@ export default function SwingTracer() {
         if (
           !isLast &&
           !isImpact &&
-          diffOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
+          changedFracOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
           nextT - prev <= Math.min(0.2, 0.25 * span)
         ) {
           dedupedN++;
@@ -982,7 +1005,7 @@ export default function SwingTracer() {
         const mid = snap((times[bestI] + times[bestI + 1]) / 2);
         if (mid <= times[bestI] || mid >= times[bestI + 1]) { noSplit.add(times[bestI]); continue; }
         const f = await sampleLuma(mid, lo.w, lo.h, lo.ctx);
-        if (diffOf(f, lumaAt.get(times[bestI])) < DEDUPE_THRESH) { noSplit.add(times[bestI]); continue; }
+        if (changedFracOf(f, lumaAt.get(times[bestI])) < DEDUPE_THRESH) { noSplit.add(times[bestI]); continue; }
         lumaAt.set(mid, f);
         times.splice(bestI + 1, 0, mid);
       }
@@ -1037,7 +1060,7 @@ export default function SwingTracer() {
           `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
           `max core gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10, core ends at ${impactTrusted ? "impact" : "85%"}) · ` +
           `post-impact ${postN}/${impactTrusted ? "3" : "3 (unenforced — low-trust impact)"} · ` +
-          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${DEDUPE_THRESH.toFixed(1)}) · ` +
+          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${(100 * DEDUPE_THRESH).toFixed(1)}% px) · ` +
           `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk ? "PASS" : "FAIL"}`
       );
     }
