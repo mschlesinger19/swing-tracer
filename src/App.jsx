@@ -829,14 +829,26 @@ export default function SwingTracer() {
       let peakI = -1;
       for (let i = i0; i <= i1; i++) if (peakI === -1 || rms[i] > rms[peakI]) peakI = i;
       if (peakI === -1) return null;
-      // onset: walk back while still ≥25% of the peak (skips pre-impact
-      // swish that merely clears the ambient floor)
+      // onset: walk back from the peak to the LEADING EDGE of the sound —
+      // where energy first rises above ambient (4× the clip median), capped
+      // at 0.7s of walk-back. NOT a fraction of the peak: on a clean outdoor
+      // "crack" the peak already is the onset (they sit <1 frame apart), but
+      // an indoor/reverberant or slow-mo-stretched strike peaks LATE — the
+      // ball hitting a net plus room reverb keep building for ~0.5s after
+      // contact — so a peak-relative walk-back lands half a second past the
+      // real strike. Measured on a face-on slow-mo net clip: peak at 10.27s
+      // but the sound (and the video club-ball contact) begins at 9.72s.
       let onI = peakI;
-      while (onI > i0 && rms[onI - 1] >= 0.25 * rms[peakI]) onI--;
+      while (onI > i0 && onI > peakI - 70 && rms[onI - 1] > 4 * med) onI--;
+      // If the leading edge sits far below the peak the strike is at the
+      // edge (reverberant/stretched); within ~0.12s it's a clean click and
+      // the peak is the crisper single-frame pick — which keeps clean-click
+      // clips landing on the exact frame they did before this refinement.
+      const impactI = (peakI - onI) * 0.01 > 0.12 ? onI : peakI;
       // dominance: the next-strongest transient ≥0.3s away
       let second = 0;
       for (let i = i0; i <= i1; i++) if (Math.abs(i - peakI) > 30) second = Math.max(second, rms[i]);
-      return { t: onI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
+      return { t: impactI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
     } catch {
       return null;
     }
