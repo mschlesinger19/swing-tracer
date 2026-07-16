@@ -781,6 +781,67 @@ export default function SwingTracer() {
     return n / (a.length / 4);
   };
 
+  // Detect the impact CLICK in the clip's audio track. This is the primary
+  // impact refiner: the strike is a broadband transient that dwarfs the
+  // range's ambient high-frequency energy — measured 69× and 408× the clip
+  // median on two real clips, landing within one frame of the visually
+  // confirmed impact on both. Every pixel heuristic tried before this
+  // failed a real clip: at analysis resolution the ball is 2–6px and sits
+  // against the clubhead at address, so static-early/changed-late ROI
+  // scoring latches onto body/shadow relocation instead (the golfer's legs
+  // fired 0.23s early on one clip; a club shadow 0.55s late on another).
+  // First-difference of the waveform ≈ high-pass filter; 10ms RMS windows;
+  // returns the onset of the strongest transient inside the marked bounds
+  // plus how decisively it wins, for the caller's trust gates. Returns
+  // null (caller falls back to pixels) for muted clips, missing WebAudio,
+  // or undecodable audio codecs.
+  const detectImpactClick = async (start, end) => {
+    try {
+      const f = fileRef.current;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!f || !AC) return null;
+      const ac = new AC();
+      let buf;
+      try {
+        buf = await ac.decodeAudioData(await f.arrayBuffer());
+      } finally {
+        ac.close?.();
+      }
+      if (!buf || !buf.length) return null;
+      const ch = buf.getChannelData(0);
+      const win = Math.max(16, Math.round(buf.sampleRate * 0.01)); // 10ms
+      const n = Math.floor((ch.length - 1) / win);
+      if (n < 20) return null;
+      const rms = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let e = 0;
+        const o = i * win;
+        for (let j = o + 1; j <= o + win; j++) {
+          const d = ch[j] - ch[j - 1];
+          e += d * d;
+        }
+        rms[i] = Math.sqrt(e / win);
+      }
+      const sorted = [...rms].sort((a, b) => a - b);
+      const med = sorted[Math.floor(n / 2)] || 1e-9;
+      const i0 = Math.max(0, Math.floor(start / 0.01));
+      const i1 = Math.min(n - 1, Math.ceil(end / 0.01));
+      let peakI = -1;
+      for (let i = i0; i <= i1; i++) if (peakI === -1 || rms[i] > rms[peakI]) peakI = i;
+      if (peakI === -1) return null;
+      // onset: walk back while still ≥25% of the peak (skips pre-impact
+      // swish that merely clears the ambient floor)
+      let onI = peakI;
+      while (onI > i0 && rms[onI - 1] >= 0.25 * rms[peakI]) onI--;
+      // dominance: the next-strongest transient ≥0.3s away
+      let second = 0;
+      for (let i = i0; i <= i1; i++) if (Math.abs(i - peakI) > 30) second = Math.max(second, rms[i]);
+      return { t: onI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
+    } catch {
+      return null;
+    }
+  };
+
   // Shared frame selection for the downloadable frame sheet, the chat-export
   // prompt, and the AI Coach direct-analysis path. History of this function:
   // pure content-driven selection missed impact (motion blur suppresses
@@ -789,17 +850,22 @@ export default function SwingTracer() {
   // fired late (follow-through is the largest sustained motion, so peak
   // errors skew late — observed +0.28s on a real clip). Current design:
   //  1. motion peak is only a SEARCH HINT for impact
-  //  2. impact refined by ball-departure: find the static-early/changed-late
-  //     region (the ball on its tee), then locate the frame boundary where
-  //     it leaves; motion peak used alone only when no ball is detectable.
-  //     The departure must be TRAILING — the >half run has to reach the end
-  //     of the search window, because the ball never comes back but a
-  //     shadow or the club crossing the ROI departs and returns (a shadow
-  //     crossing was accepted as impact by the old 3-consecutive-samples
-  //     rule on a real clip). The window spans peak−0.5s → peak+0.35s:
-  //     peak errors usually skew late, but on low-contrast clips the peak
-  //     can fire early too (takeaway ≈ downswing at 96px), and the old
-  //     peak+0.1s end sometimes didn't even contain impact.
+  //  2. impact refined by the AUDIO CLICK (detectImpactClick above) when
+  //     the transient is decisive: ratio ≥12× ambient, ≥2× the next
+  //     transient ≥0.3s away, and plausible against the motion peak
+  //     ([peak−0.9s, peak+0.4s] — sanity only; audio supplies the
+  //     precision). Acceptance ⇒ trusted (rule 5) and the pixel fallback
+  //     is skipped entirely.
+  //  2b. fallback for muted/undecodable audio: ball-departure at a
+  //     static-early/changed-late ROI. The departure must be TRAILING —
+  //     the >half run has to reach the end of the search window, because
+  //     the ball never comes back but a shadow or the club crossing the
+  //     ROI departs and returns (a shadow crossing was accepted as impact
+  //     by the old 3-consecutive-samples rule on a real clip). The window
+  //     spans peak−0.5s → peak+0.35s: peak errors usually skew late, but
+  //     on low-contrast clips the peak can fire early too (takeaway ≈
+  //     downswing at 96px), and the old peak+0.1s end sometimes didn't
+  //     even contain impact.
   //  3. dense sampling window is ASYMMETRIC around the estimate
   //     (impact−0.35s → impact+0.05s) since errors skew late
   //  4. ≤3 frames after estimated impact (release / mid / finish) — the
@@ -879,78 +945,95 @@ export default function SwingTracer() {
     const scanMedian = scanSorted[Math.floor(scanSorted.length / 2)] || 0.001;
     const peakSharp = scanDiffs[peakI] / scanMedian;
 
-    // ---- pass 2: find the ball — static through the early window (golfer
-    // moves, ball doesn't), permanently changed by the end (ball gone).
-    // Block-level scoring; restricted to the lower 60% of the frame since
-    // the ball sits at ground/tee height.
-    const BLOCK = 16;
-    const avgBlockDiff = (a, b, bx, by) => {
-      let sum = 0, n = 0;
-      for (let y = by; y < Math.min(by + BLOCK, hi.h); y++)
-        for (let x = bx; x < Math.min(bx + BLOCK, hi.w); x++) {
-          const p = (y * hi.w + x) * 4;
-          sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
-          n++;
-        }
-      return n ? sum / n : 0;
-    };
-    const earlyTimes = Array.from({ length: 6 }, (_, i) => snap(start + (i / 5) * 0.35 * span));
-    const lateTimes = Array.from({ length: 3 }, (_, i) => snap(end - (i / 2) * 0.06 * span));
-    const earlyFrames = [];
-    for (const t of earlyTimes) earlyFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
-    const lateFrames = [];
-    for (const t of lateTimes) lateFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
-    const earlyMean = new Float32Array(earlyFrames[0].length);
-    for (const f of earlyFrames) for (let p = 0; p < f.length; p++) earlyMean[p] += f[p] / earlyFrames.length;
-    const lateMean = new Float32Array(lateFrames[0].length);
-    for (const f of lateFrames) for (let p = 0; p < f.length; p++) lateMean[p] += f[p] / lateFrames.length;
+    let impactT = peakT;
+    let impactTrusted = false; // earned by a decisive audio click, or ball-departure agreeing with the peak
+    let impactMethod = `motion peak only (no impact click, no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
 
-    let ball = null; // { bx, by, lateChange }
-    {
-      const cands = [];
-      for (let by = Math.floor(hi.h * 0.4 / BLOCK) * BLOCK; by < hi.h; by += BLOCK) {
-        for (let bx = 0; bx < hi.w; bx += BLOCK) {
-          let earlyVar = 0;
-          for (const f of earlyFrames) earlyVar = Math.max(earlyVar, avgBlockDiff(f, earlyMean, bx, by));
-          const lateChange = avgBlockDiff(earlyMean, lateMean, bx, by);
-          cands.push({ bx, by, earlyVar, lateChange });
-        }
-      }
-      const lcSorted = cands.map((x) => x.lateChange).sort((a, b) => a - b);
-      const lcMedian = lcSorted[Math.floor(lcSorted.length / 2)] || 0.001;
-      const best = cands
-        .filter((x) => x.lateChange > Math.max(3 * lcMedian, 8) && x.earlyVar < 0.3 * x.lateChange)
-        .sort((a, b) => b.lateChange - a.lateChange)[0];
-      if (best) ball = best;
+    // ---- pass 2: audio impact click (rule 2) — the primary refiner ----
+    const click = await detectImpactClick(start, end);
+    if (click && click.ratio >= 12 && click.dominance >= 2 && click.t >= peakT - 0.9 && click.t <= peakT + 0.4) {
+      impactT = snap(click.t);
+      impactTrusted = true;
+      impactMethod = `audio impact click, ${click.ratio.toFixed(0)}× ambient, ${click.dominance.toFixed(1)}× next transient`;
+    } else if (click) {
+      console.info(
+        `[frames] audio click rejected: t=${click.t.toFixed(2)} ratio=${click.ratio.toFixed(1)} ` +
+          `dominance=${click.dominance.toFixed(1)} vs motion peak ${peakT.toFixed(2)} — falling back to pixels`
+      );
     }
 
-    // ---- pass 3: ball-departure search. Window skews EARLY of the motion
-    // peak because peak errors skew late (follow-through dominates motion).
-    let impactT = peakT;
-    let impactTrusted = false; // earned only when two independent estimates agree — see rule 5
-    let impactMethod = `motion peak only (no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
-    if (ball) {
-      const sStart = Math.max(start, peakT - 0.5);
-      const sEnd = Math.min(end, peakT + 0.35);
-      const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
-      const half = ball.lateChange * 0.5;
-      // trailing-run rule (rule 2): impact = start of the departed run that
-      // reaches the window end; transient crossings depart and return
-      const curve = [];
-      for (let t = sStart; t <= sEnd + 1e-6; t += step) {
-        const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
-        curve.push([snap(t), avgBlockDiff(f, earlyMean, ball.bx, ball.by)]);
+    // ---- pass 2b (fallback, rule 2b): find the ball — static through the
+    // early window (golfer moves, ball doesn't), permanently changed by the
+    // end (ball gone). Block-level scoring; restricted to the lower 60% of
+    // the frame since the ball sits at ground/tee height. Skipped entirely
+    // when the audio click confirmed (saves ~50 seeks).
+    if (!impactTrusted) {
+      const BLOCK = 16;
+      const avgBlockDiff = (a, b, bx, by) => {
+        let sum = 0, n = 0;
+        for (let y = by; y < Math.min(by + BLOCK, hi.h); y++)
+          for (let x = bx; x < Math.min(bx + BLOCK, hi.w); x++) {
+            const p = (y * hi.w + x) * 4;
+            sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
+            n++;
+          }
+        return n ? sum / n : 0;
+      };
+      const earlyTimes = Array.from({ length: 6 }, (_, i) => snap(start + (i / 5) * 0.35 * span));
+      const lateTimes = Array.from({ length: 3 }, (_, i) => snap(end - (i / 2) * 0.06 * span));
+      const earlyFrames = [];
+      for (const t of earlyTimes) earlyFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+      const lateFrames = [];
+      for (const t of lateTimes) lateFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+      const earlyMean = new Float32Array(earlyFrames[0].length);
+      for (const f of earlyFrames) for (let p = 0; p < f.length; p++) earlyMean[p] += f[p] / earlyFrames.length;
+      const lateMean = new Float32Array(lateFrames[0].length);
+      for (const f of lateFrames) for (let p = 0; p < f.length; p++) lateMean[p] += f[p] / lateFrames.length;
+
+      let ball = null; // { bx, by, lateChange }
+      {
+        const cands = [];
+        for (let by = Math.floor(hi.h * 0.4 / BLOCK) * BLOCK; by < hi.h; by += BLOCK) {
+          for (let bx = 0; bx < hi.w; bx += BLOCK) {
+            let earlyVar = 0;
+            for (const f of earlyFrames) earlyVar = Math.max(earlyVar, avgBlockDiff(f, earlyMean, bx, by));
+            const lateChange = avgBlockDiff(earlyMean, lateMean, bx, by);
+            cands.push({ bx, by, earlyVar, lateChange });
+          }
+        }
+        const lcSorted = cands.map((x) => x.lateChange).sort((a, b) => a - b);
+        const lcMedian = lcSorted[Math.floor(lcSorted.length / 2)] || 0.001;
+        const best = cands
+          .filter((x) => x.lateChange > Math.max(3 * lcMedian, 8) && x.earlyVar < 0.3 * x.lateChange)
+          .sort((a, b) => b.lateChange - a.lateChange)[0];
+        if (best) ball = best;
       }
-      let runStart = -1;
-      for (let i = curve.length - 1; i >= 0 && curve[i][1] > half; i--) runStart = i;
-      if (runStart !== -1 && curve.length - runStart >= 3) {
-        const found = curve[runStart][0];
-        const delta = peakT - found;
-        impactT = found;
-        impactTrusted = Math.abs(delta) <= 0.08;
-        impactMethod =
-          `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
-          (impactTrusted ? "agreed" : "away — unconfirmed, coverage safety rules kept");
+
+      // ---- pass 3: ball-departure search. Window skews EARLY of the motion
+      // peak because peak errors skew late (follow-through dominates motion).
+      if (ball) {
+        const sStart = Math.max(start, peakT - 0.5);
+        const sEnd = Math.min(end, peakT + 0.35);
+        const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
+        const half = ball.lateChange * 0.5;
+        // trailing-run rule (rule 2b): impact = start of the departed run
+        // that reaches the window end; transient crossings depart and return
+        const curve = [];
+        for (let t = sStart; t <= sEnd + 1e-6; t += step) {
+          const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
+          curve.push([snap(t), avgBlockDiff(f, earlyMean, ball.bx, ball.by)]);
+        }
+        let runStart = -1;
+        for (let i = curve.length - 1; i >= 0 && curve[i][1] > half; i--) runStart = i;
+        if (runStart !== -1 && curve.length - runStart >= 3) {
+          const found = curve[runStart][0];
+          const delta = peakT - found;
+          impactT = found;
+          impactTrusted = Math.abs(delta) <= 0.08;
+          impactMethod =
+            `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
+            (impactTrusted ? "agreed" : "away — unconfirmed, coverage safety rules kept");
+        }
       }
     }
 
@@ -975,7 +1058,12 @@ export default function SwingTracer() {
       }
     }
 
-    let times = [...new Set([...sparse, ...denseTimes, snap(end)].map(snap))].sort((a, b) => a - b);
+    // snap(impactT) is included EXPLICITLY: the dense grid was assumed to
+    // land on it via denseEnd = impact+0.05, but its sample points sit on
+    // exact half-frame boundaries where float error tips Math.round either
+    // way — one real sheet shipped with every dense point rounded down and
+    // no impact frame at all.
+    let times = [...new Set([...sparse, ...denseTimes, snap(impactT), snap(end)].map(snap))].sort((a, b) => a - b);
 
     // ---- rule 4: at most 3 frames after estimated impact — release, mid
     // follow-through, finish hold. (Estimate-independent coverage rules run
@@ -1129,13 +1217,15 @@ export default function SwingTracer() {
       }
       const postN = times.filter((t) => t > impactT + frameDur / 2).length;
       const postOk = !impactTrusted || postN <= 3;
+      const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
       console.info(
-        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} · ` +
+        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} ` +
+          `(frame ${impactPresent ? "present" : "MISSING"}) · ` +
           `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
           `max core gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10, core ends at ${impactTrusted ? "impact" : "85%"}) · ` +
           `post-impact ${postN}/${impactTrusted ? "3" : "3 (unenforced — low-trust impact)"} · ` +
           `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${(100 * DEDUPE_THRESH).toFixed(1)}% px) · ` +
-          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk ? "PASS" : "FAIL"}`
+          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk && impactPresent ? "PASS" : "FAIL"}`
       );
     }
 
