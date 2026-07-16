@@ -296,6 +296,7 @@ export default function SwingTracer() {
   const [duration, setDuration] = useState(0);
   const [speed, setSpeed] = useState(0.5);
   const [fps, setFps] = useState(60);
+  const [fpsSource, setFpsSource] = useState("default"); // default | detected | manual
   const [view, setView] = useState("dtl");
   const [tool, setTool] = useState("off");
   const [color, setColor] = useState(DRAW_COLORS[0]);
@@ -314,6 +315,8 @@ export default function SwingTracer() {
   const [scrubT, setScrubT] = useState(null); // non-null while finger owns the scrubber
   const wasPlayingRef = useRef(false);
   const primedRef = useRef(false); // first frame painted yet?
+  const fpsDetectRef = useRef(false); // fps detection attempted for this clip?
+  const fpsManualRef = useRef(false); // user overrode fps for this clip?
   const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error
   const [loadMsg, setLoadMsg] = useState("");
   const fileRef = useRef(null);
@@ -351,6 +354,9 @@ export default function SwingTracer() {
     fileRef.current = f;
     triedDataUrl.current = false;
     primedRef.current = false;
+    fpsDetectRef.current = false;
+    fpsManualRef.current = false;
+    setFpsSource("default");
     setLoadState("loading");
     setLoadMsg(`Loading ${f.name} (${(f.size / 1048576).toFixed(1)} MB)…`);
     setSrc(URL.createObjectURL(f));
@@ -441,10 +447,67 @@ export default function SwingTracer() {
         requestAnimationFrame(() => {
           v.pause();
           try { v.currentTime = 0; } catch {}
+          detectClipFps();
         });
       }).catch(() => {
         try { v.currentTime = 0.01; } catch {} // fallback: the old nudge
       });
+    }
+  };
+
+  // Measure the clip's real frame rate instead of making the golfer know it
+  // — the wrong value silently corrupts the export's frame-snapping grid
+  // (a 60fps grid on a 30fps clip "selects" duplicate source frames; that
+  // shipped on real sheets because 60 was just the untouched default).
+  // requestVideoFrameCallback reports the SOURCE timestamp of each painted
+  // frame, so consecutive mediaTime deltas are exact frame durations.
+  // Playback runs muted at 0.25× so high-fps slo-mo clips present more of
+  // their frames within the display's refresh budget; the low-quartile
+  // delta rides over dropped-frame doubles. The fps select stays as an
+  // override and always wins once touched.
+  const detectClipFps = async () => {
+    const v = videoRef.current;
+    if (!v || fpsDetectRef.current || !("requestVideoFrameCallback" in v)) return;
+    fpsDetectRef.current = true;
+    const t0 = v.currentTime;
+    const rate0 = v.playbackRate;
+    const muted0 = v.muted;
+    const deltas = [];
+    let handle = null;
+    try {
+      v.muted = true;
+      v.playbackRate = 0.25;
+      const collected = new Promise((resolve) => {
+        let last = null;
+        const stop = setTimeout(resolve, 2000);
+        const onFrame = (_now, meta) => {
+          if (last != null && meta.mediaTime > last + 0.0005) deltas.push(meta.mediaTime - last);
+          last = meta.mediaTime;
+          if (deltas.length >= 20) { clearTimeout(stop); resolve(); }
+          else handle = v.requestVideoFrameCallback(onFrame);
+        };
+        handle = v.requestVideoFrameCallback(onFrame);
+      });
+      await v.play();
+      await collected;
+    } catch {
+      /* autoplay blocked or decode hiccup — the manual selector still works */
+    } finally {
+      if (handle != null && "cancelVideoFrameCallback" in v) v.cancelVideoFrameCallback(handle);
+      v.pause();
+      v.playbackRate = rate0;
+      v.muted = muted0;
+      try { v.currentTime = t0; } catch {}
+    }
+    if (deltas.length < 6) return; // not enough evidence — keep the default
+    deltas.sort((a, b) => a - b);
+    const raw = 1 / deltas[Math.floor(deltas.length * 0.25)];
+    const common = [24, 25, 30, 50, 60, 100, 120, 240];
+    const detected = common.find((c) => Math.abs(raw - c) / c < 0.1) ?? Math.round(raw);
+    console.info(`[fps] detected ${detected} (raw ${raw.toFixed(2)} from ${deltas.length} deltas)`);
+    if (!fpsManualRef.current) {
+      setFps(detected);
+      setFpsSource("detected");
     }
   };
 
@@ -709,6 +772,76 @@ export default function SwingTracer() {
     return sum / (a.length / 4);
   };
 
+  // fraction of pixels whose |ΔR|+|ΔB| exceeds a per-pixel threshold — the
+  // near-identical test for the dedupe pass in getExportFrames. See rule 7
+  // there for why this beats the mean diff for that job.
+  const changedFracOf = (a, b) => {
+    let n = 0;
+    for (let p = 0; p < a.length; p += 4) if (Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]) > 40) n++;
+    return n / (a.length / 4);
+  };
+
+  // Detect the impact CLICK in the clip's audio track. This is the primary
+  // impact refiner: the strike is a broadband transient that dwarfs the
+  // range's ambient high-frequency energy — measured 69× and 408× the clip
+  // median on two real clips, landing within one frame of the visually
+  // confirmed impact on both. Every pixel heuristic tried before this
+  // failed a real clip: at analysis resolution the ball is 2–6px and sits
+  // against the clubhead at address, so static-early/changed-late ROI
+  // scoring latches onto body/shadow relocation instead (the golfer's legs
+  // fired 0.23s early on one clip; a club shadow 0.55s late on another).
+  // First-difference of the waveform ≈ high-pass filter; 10ms RMS windows;
+  // returns the onset of the strongest transient inside the marked bounds
+  // plus how decisively it wins, for the caller's trust gates. Returns
+  // null (caller falls back to pixels) for muted clips, missing WebAudio,
+  // or undecodable audio codecs.
+  const detectImpactClick = async (start, end) => {
+    try {
+      const f = fileRef.current;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!f || !AC) return null;
+      const ac = new AC();
+      let buf;
+      try {
+        buf = await ac.decodeAudioData(await f.arrayBuffer());
+      } finally {
+        ac.close?.();
+      }
+      if (!buf || !buf.length) return null;
+      const ch = buf.getChannelData(0);
+      const win = Math.max(16, Math.round(buf.sampleRate * 0.01)); // 10ms
+      const n = Math.floor((ch.length - 1) / win);
+      if (n < 20) return null;
+      const rms = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let e = 0;
+        const o = i * win;
+        for (let j = o + 1; j <= o + win; j++) {
+          const d = ch[j] - ch[j - 1];
+          e += d * d;
+        }
+        rms[i] = Math.sqrt(e / win);
+      }
+      const sorted = [...rms].sort((a, b) => a - b);
+      const med = sorted[Math.floor(n / 2)] || 1e-9;
+      const i0 = Math.max(0, Math.floor(start / 0.01));
+      const i1 = Math.min(n - 1, Math.ceil(end / 0.01));
+      let peakI = -1;
+      for (let i = i0; i <= i1; i++) if (peakI === -1 || rms[i] > rms[peakI]) peakI = i;
+      if (peakI === -1) return null;
+      // onset: walk back while still ≥25% of the peak (skips pre-impact
+      // swish that merely clears the ambient floor)
+      let onI = peakI;
+      while (onI > i0 && rms[onI - 1] >= 0.25 * rms[peakI]) onI--;
+      // dominance: the next-strongest transient ≥0.3s away
+      let second = 0;
+      for (let i = i0; i <= i1; i++) if (Math.abs(i - peakI) > 30) second = Math.max(second, rms[i]);
+      return { t: onI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
+    } catch {
+      return null;
+    }
+  };
+
   // Shared frame selection for the downloadable frame sheet, the chat-export
   // prompt, and the AI Coach direct-analysis path. History of this function:
   // pure content-driven selection missed impact (motion blur suppresses
@@ -717,9 +850,22 @@ export default function SwingTracer() {
   // fired late (follow-through is the largest sustained motion, so peak
   // errors skew late — observed +0.28s on a real clip). Current design:
   //  1. motion peak is only a SEARCH HINT for impact
-  //  2. impact refined by ball-departure: find the static-early/changed-late
-  //     region (the ball on its tee), then locate the frame boundary where
-  //     it leaves; motion peak used alone only when no ball is detectable
+  //  2. impact refined by the AUDIO CLICK (detectImpactClick above) when
+  //     the transient is decisive: ratio ≥12× ambient, ≥2× the next
+  //     transient ≥0.3s away, and plausible against the motion peak
+  //     ([peak−0.9s, peak+0.4s] — sanity only; audio supplies the
+  //     precision). Acceptance ⇒ trusted (rule 5) and the pixel fallback
+  //     is skipped entirely.
+  //  2b. fallback for muted/undecodable audio: ball-departure at a
+  //     static-early/changed-late ROI. The departure must be TRAILING —
+  //     the >half run has to reach the end of the search window, because
+  //     the ball never comes back but a shadow or the club crossing the
+  //     ROI departs and returns (a shadow crossing was accepted as impact
+  //     by the old 3-consecutive-samples rule on a real clip). The window
+  //     spans peak−0.5s → peak+0.35s: peak errors usually skew late, but
+  //     on low-contrast clips the peak can fire early too (takeaway ≈
+  //     downswing at 96px), and the old peak+0.1s end sometimes didn't
+  //     even contain impact.
   //  3. dense sampling window is ASYMMETRIC around the estimate
   //     (impact−0.35s → impact+0.05s) since errors skew late
   //  4. ≤3 frames after estimated impact (release / mid / finish) — the
@@ -728,20 +874,30 @@ export default function SwingTracer() {
   //     when every estimate above is wrong: no gap >0.10s inside the
   //     40–85% region of the marked window, no gap >25% of the window
   //     anywhere, ≥12 frames; results of these checks logged per sheet.
-  //     When impact is BALL-CONFIRMED the 0.10s core region ends at impact
-  //     instead of 85% — the unconditional version re-inserted the exact
-  //     follow-through frames rule 4 had removed whenever impact fell
-  //     inside the 40-85% band (observed: 7 post-impact frames on a sheet
-  //     whose impact sat at 68% of the window). Low-trust estimates keep
-  //     the full 40-85% safety net, so the post-impact cap is best-effort
-  //     only in that case.
+  //     When the ball-departure and motion-peak estimates AGREE (±0.08s)
+  //     the 0.10s core region ends at impact instead of 85% — the
+  //     unconditional version re-inserted the exact follow-through frames
+  //     rule 4 had removed whenever impact fell inside the 40-85% band
+  //     (observed: 7 post-impact frames on a sheet whose impact sat at 68%
+  //     of the window). Agreement is required because a false ROI can pass
+  //     every departure filter (observed: the golfer's legs — static in
+  //     the backswing, permanently shifted once the downswing starts —
+  //     "departed" 0.23s before real impact; shrinking coverage around
+  //     that estimate would have opened a hole over the true delivery).
+  //     Unconfirmed estimates keep the full 40-85% safety net, so the
+  //     post-impact cap is best-effort only in that case.
   //  6. every timestamp snapped to a real source frame at the declared fps
   //  7. visually-static dedupe: a selected frame nearly pixel-identical to
   //     the previously kept one is dropped (the club hovers at the top, so
   //     time-uniform dense sampling bought 5 duplicate top-of-backswing
-  //     frames). Identical pixels are proof no action was missed, so these
-  //     gaps are exempt from the 0.10s core rule — but never the impact
-  //     frame or an endpoint, and the global 25% ceiling still applies
+  //     frames). Near-identical is judged by the FRACTION of changed
+  //     pixels, not the mean diff — compression noise moves many pixels a
+  //     little, a moving club moves few pixels a lot (measured: hover
+  //     pairs ≤0.5% changed vs ≥1.1% on real motion, where the mean
+  //     overlapped). Identical pixels are proof no action was missed, so
+  //     these gaps are exempt from the 0.10s core rule — but never the
+  //     impact frame or an endpoint, and the global 25% ceiling still
+  //     applies
   //  8. budget freed by 4+7 is spent on the takeaway (start → dense
   //     window), splitting gaps >0.30s — previously ~0.5s takeaway gaps
   //     left no shaft-parallel-back frame
@@ -771,89 +927,113 @@ export default function SwingTracer() {
     for (const t of scanTimes) scanData.push(await sampleLuma(t, lo.w, lo.h, lo.ctx));
     const scanDiffs = [0];
     for (let i = 1; i < N; i++) scanDiffs.push(diffOf(scanData[i], scanData[i - 1]));
-    let peakI = 1;
-    for (let i = 2; i < N; i++) if (scanDiffs[i] > scanDiffs[peakI]) peakI = i;
+    // Impact physically can't be in the front half of a marked P1→P10 swing
+    // (the backswing consumes most of the clock), yet takeaway motion can
+    // outscore the downswing at 96px — observed on a real clip: the global
+    // peak landed on the takeaway, 1.1s before impact, and dragged the
+    // dense window, the post-impact cap and the takeaway budget with it.
+    // Only the back 55% of the marked window is searched.
+    const peakFloor = start + 0.45 * span;
+    let peakI = -1;
+    for (let i = 1; i < N; i++) {
+      if (scanTimes[i] < peakFloor) continue;
+      if (peakI === -1 || scanDiffs[i] > scanDiffs[peakI]) peakI = i;
+    }
+    if (peakI === -1) peakI = N - 1; // degenerate: window too small to split
     const peakT = scanTimes[peakI];
     const scanSorted = [...scanDiffs].sort((a, b) => a - b);
     const scanMedian = scanSorted[Math.floor(scanSorted.length / 2)] || 0.001;
     const peakSharp = scanDiffs[peakI] / scanMedian;
 
-    // ---- pass 2: find the ball — static through the early window (golfer
-    // moves, ball doesn't), permanently changed by the end (ball gone).
-    // Block-level scoring; restricted to the lower 60% of the frame since
-    // the ball sits at ground/tee height.
-    const BLOCK = 16;
-    const avgBlockDiff = (a, b, bx, by) => {
-      let sum = 0, n = 0;
-      for (let y = by; y < Math.min(by + BLOCK, hi.h); y++)
-        for (let x = bx; x < Math.min(bx + BLOCK, hi.w); x++) {
-          const p = (y * hi.w + x) * 4;
-          sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
-          n++;
-        }
-      return n ? sum / n : 0;
-    };
-    const earlyTimes = Array.from({ length: 6 }, (_, i) => snap(start + (i / 5) * 0.35 * span));
-    const lateTimes = Array.from({ length: 3 }, (_, i) => snap(end - (i / 2) * 0.06 * span));
-    const earlyFrames = [];
-    for (const t of earlyTimes) earlyFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
-    const lateFrames = [];
-    for (const t of lateTimes) lateFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
-    const earlyMean = new Float32Array(earlyFrames[0].length);
-    for (const f of earlyFrames) for (let p = 0; p < f.length; p++) earlyMean[p] += f[p] / earlyFrames.length;
-    const lateMean = new Float32Array(lateFrames[0].length);
-    for (const f of lateFrames) for (let p = 0; p < f.length; p++) lateMean[p] += f[p] / lateFrames.length;
+    let impactT = peakT;
+    let impactTrusted = false; // earned by a decisive audio click, or ball-departure agreeing with the peak
+    let impactMethod = `motion peak only (no impact click, no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
 
-    let ball = null; // { bx, by, lateChange }
-    {
-      const cands = [];
-      for (let by = Math.floor(hi.h * 0.4 / BLOCK) * BLOCK; by < hi.h; by += BLOCK) {
-        for (let bx = 0; bx < hi.w; bx += BLOCK) {
-          let earlyVar = 0;
-          for (const f of earlyFrames) earlyVar = Math.max(earlyVar, avgBlockDiff(f, earlyMean, bx, by));
-          const lateChange = avgBlockDiff(earlyMean, lateMean, bx, by);
-          cands.push({ bx, by, earlyVar, lateChange });
-        }
-      }
-      const lcSorted = cands.map((x) => x.lateChange).sort((a, b) => a - b);
-      const lcMedian = lcSorted[Math.floor(lcSorted.length / 2)] || 0.001;
-      const best = cands
-        .filter((x) => x.lateChange > Math.max(3 * lcMedian, 8) && x.earlyVar < 0.3 * x.lateChange)
-        .sort((a, b) => b.lateChange - a.lateChange)[0];
-      if (best) ball = best;
+    // ---- pass 2: audio impact click (rule 2) — the primary refiner ----
+    const click = await detectImpactClick(start, end);
+    if (click && click.ratio >= 12 && click.dominance >= 2 && click.t >= peakT - 0.9 && click.t <= peakT + 0.4) {
+      impactT = snap(click.t);
+      impactTrusted = true;
+      impactMethod = `audio impact click, ${click.ratio.toFixed(0)}× ambient, ${click.dominance.toFixed(1)}× next transient`;
+    } else if (click) {
+      console.info(
+        `[frames] audio click rejected: t=${click.t.toFixed(2)} ratio=${click.ratio.toFixed(1)} ` +
+          `dominance=${click.dominance.toFixed(1)} vs motion peak ${peakT.toFixed(2)} — falling back to pixels`
+      );
     }
 
-    // ---- pass 3: ball-departure search. Window skews EARLY of the motion
-    // peak because peak errors skew late (follow-through dominates motion).
-    let impactT = peakT;
-    let impactTrusted = false; // true only when ball-departure confirms the estimate
-    let impactMethod = `motion peak only (no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
-    if (ball) {
-      const sStart = Math.max(start, peakT - 0.5);
-      const sEnd = Math.min(end, peakT + 0.1);
-      const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
-      const half = ball.lateChange * 0.5;
-      let found = null;
-      let run = 0;
-      for (let t = sStart; t <= sEnd + 1e-6; t += step) {
-        const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
-        const d = avgBlockDiff(f, earlyMean, ball.bx, ball.by);
-        if (d > half) {
-          run++;
-          if (run === 1) found = snap(t);
-          if (run >= 3) break; // departed and stayed departed — that's impact
-        } else {
-          run = 0;
-          found = null;
+    // ---- pass 2b (fallback, rule 2b): find the ball — static through the
+    // early window (golfer moves, ball doesn't), permanently changed by the
+    // end (ball gone). Block-level scoring; restricted to the lower 60% of
+    // the frame since the ball sits at ground/tee height. Skipped entirely
+    // when the audio click confirmed (saves ~50 seeks).
+    if (!impactTrusted) {
+      const BLOCK = 16;
+      const avgBlockDiff = (a, b, bx, by) => {
+        let sum = 0, n = 0;
+        for (let y = by; y < Math.min(by + BLOCK, hi.h); y++)
+          for (let x = bx; x < Math.min(bx + BLOCK, hi.w); x++) {
+            const p = (y * hi.w + x) * 4;
+            sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
+            n++;
+          }
+        return n ? sum / n : 0;
+      };
+      const earlyTimes = Array.from({ length: 6 }, (_, i) => snap(start + (i / 5) * 0.35 * span));
+      const lateTimes = Array.from({ length: 3 }, (_, i) => snap(end - (i / 2) * 0.06 * span));
+      const earlyFrames = [];
+      for (const t of earlyTimes) earlyFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+      const lateFrames = [];
+      for (const t of lateTimes) lateFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+      const earlyMean = new Float32Array(earlyFrames[0].length);
+      for (const f of earlyFrames) for (let p = 0; p < f.length; p++) earlyMean[p] += f[p] / earlyFrames.length;
+      const lateMean = new Float32Array(lateFrames[0].length);
+      for (const f of lateFrames) for (let p = 0; p < f.length; p++) lateMean[p] += f[p] / lateFrames.length;
+
+      let ball = null; // { bx, by, lateChange }
+      {
+        const cands = [];
+        for (let by = Math.floor(hi.h * 0.4 / BLOCK) * BLOCK; by < hi.h; by += BLOCK) {
+          for (let bx = 0; bx < hi.w; bx += BLOCK) {
+            let earlyVar = 0;
+            for (const f of earlyFrames) earlyVar = Math.max(earlyVar, avgBlockDiff(f, earlyMean, bx, by));
+            const lateChange = avgBlockDiff(earlyMean, lateMean, bx, by);
+            cands.push({ bx, by, earlyVar, lateChange });
+          }
         }
+        const lcSorted = cands.map((x) => x.lateChange).sort((a, b) => a - b);
+        const lcMedian = lcSorted[Math.floor(lcSorted.length / 2)] || 0.001;
+        const best = cands
+          .filter((x) => x.lateChange > Math.max(3 * lcMedian, 8) && x.earlyVar < 0.3 * x.lateChange)
+          .sort((a, b) => b.lateChange - a.lateChange)[0];
+        if (best) ball = best;
       }
-      if (found != null && run >= 3) {
-        const delta = peakT - found;
-        impactT = found;
-        impactTrusted = true;
-        impactMethod =
-          `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
-          (Math.abs(delta) > 0.06 ? "rejected" : "agreed");
+
+      // ---- pass 3: ball-departure search. Window skews EARLY of the motion
+      // peak because peak errors skew late (follow-through dominates motion).
+      if (ball) {
+        const sStart = Math.max(start, peakT - 0.5);
+        const sEnd = Math.min(end, peakT + 0.35);
+        const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
+        const half = ball.lateChange * 0.5;
+        // trailing-run rule (rule 2b): impact = start of the departed run
+        // that reaches the window end; transient crossings depart and return
+        const curve = [];
+        for (let t = sStart; t <= sEnd + 1e-6; t += step) {
+          const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
+          curve.push([snap(t), avgBlockDiff(f, earlyMean, ball.bx, ball.by)]);
+        }
+        let runStart = -1;
+        for (let i = curve.length - 1; i >= 0 && curve[i][1] > half; i--) runStart = i;
+        if (runStart !== -1 && curve.length - runStart >= 3) {
+          const found = curve[runStart][0];
+          const delta = peakT - found;
+          impactT = found;
+          impactTrusted = Math.abs(delta) <= 0.08;
+          impactMethod =
+            `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
+            (impactTrusted ? "agreed" : "away — unconfirmed, coverage safety rules kept");
+        }
       }
     }
 
@@ -878,7 +1058,12 @@ export default function SwingTracer() {
       }
     }
 
-    let times = [...new Set([...sparse, ...denseTimes, snap(end)].map(snap))].sort((a, b) => a - b);
+    // snap(impactT) is included EXPLICITLY: the dense grid was assumed to
+    // land on it via denseEnd = impact+0.05, but its sample points sit on
+    // exact half-frame boundaries where float error tips Math.round either
+    // way — one real sheet shipped with every dense point rounded down and
+    // no impact frame at all.
+    let times = [...new Set([...sparse, ...denseTimes, snap(impactT), snap(end)].map(snap))].sort((a, b) => a - b);
 
     // ---- rule 4: at most 3 frames after estimated impact — release, mid
     // follow-through, finish hold. (Estimate-independent coverage rules run
@@ -929,7 +1114,7 @@ export default function SwingTracer() {
     // hover lasts ~0.3-0.4s and collapsing it entirely hides how long the
     // club sat there; a bookend every ≤0.2s keeps ~2 frames at the top,
     // which is the budget the analysis actually wants spent there.
-    const DEDUPE_THRESH = Math.max(1.5, 0.45 * scanMedian);
+    const DEDUPE_THRESH = 0.007; // <0.7% of pixels changed = visually static
     const lumaAt = new Map();
     for (const t of times) lumaAt.set(t, await sampleLuma(t, lo.w, lo.h, lo.ctx));
     const staticSpans = []; // [a, b] gaps whose dropped interior frames all matched a
@@ -946,7 +1131,7 @@ export default function SwingTracer() {
         if (
           !isLast &&
           !isImpact &&
-          diffOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
+          changedFracOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
           nextT - prev <= Math.min(0.2, 0.25 * span)
         ) {
           dedupedN++;
@@ -982,7 +1167,7 @@ export default function SwingTracer() {
         const mid = snap((times[bestI] + times[bestI + 1]) / 2);
         if (mid <= times[bestI] || mid >= times[bestI + 1]) { noSplit.add(times[bestI]); continue; }
         const f = await sampleLuma(mid, lo.w, lo.h, lo.ctx);
-        if (diffOf(f, lumaAt.get(times[bestI])) < DEDUPE_THRESH) { noSplit.add(times[bestI]); continue; }
+        if (changedFracOf(f, lumaAt.get(times[bestI])) < DEDUPE_THRESH) { noSplit.add(times[bestI]); continue; }
         lumaAt.set(mid, f);
         times.splice(bestI + 1, 0, mid);
       }
@@ -1032,13 +1217,15 @@ export default function SwingTracer() {
       }
       const postN = times.filter((t) => t > impactT + frameDur / 2).length;
       const postOk = !impactTrusted || postN <= 3;
+      const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
       console.info(
-        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} · ` +
+        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} ` +
+          `(frame ${impactPresent ? "present" : "MISSING"}) · ` +
           `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
           `max core gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10, core ends at ${impactTrusted ? "impact" : "85%"}) · ` +
           `post-impact ${postN}/${impactTrusted ? "3" : "3 (unenforced — low-trust impact)"} · ` +
-          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${DEDUPE_THRESH.toFixed(1)}) · ` +
-          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk ? "PASS" : "FAIL"}`
+          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${(100 * DEDUPE_THRESH).toFixed(1)}% px) · ` +
+          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk && impactPresent ? "PASS" : "FAIL"}`
       );
     }
 
@@ -1070,9 +1257,37 @@ export default function SwingTracer() {
     const labelH = 34;
     const headerH = 30;
     const pad = 6;
+
+    // Long annotations (the impact-method string) live in a sheet-level
+    // footer; tiles carry only a short marker. Drawing the full string on
+    // the tile overflowed into the neighboring tile and rendered as
+    // garbled overstrike.
+    const impactCell = cells.find((c) => c.isImpactHint);
+    const footerFont = "500 14px ui-monospace, Menlo, monospace";
+    const footerLineH = 19;
+    const footerLines = [];
+    if (impactCell) {
+      const meas = document.createElement("canvas").getContext("2d");
+      meas.font = footerFont;
+      const text =
+        `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — estimated impact: ` +
+        `${impactCell.impactConfidence}. Treat as a hint, not truth.`;
+      const maxW = cols * cw + (cols - 1) * pad - 4;
+      let line = "";
+      for (const word of text.split(" ")) {
+        const probe = line ? `${line} ${word}` : word;
+        if (line && meas.measureText(probe).width > maxW) {
+          footerLines.push(line);
+          line = word;
+        } else line = probe;
+      }
+      if (line) footerLines.push(line);
+    }
+    const footerH = footerLines.length ? footerLines.length * footerLineH + pad * 2 : 0;
+
     const sheet = document.createElement("canvas");
     sheet.width = cols * cw + (cols + 1) * pad;
-    sheet.height = headerH + rows * (ch + labelH + pad) + pad;
+    sheet.height = headerH + rows * (ch + labelH + pad) + pad + footerH;
     const ctx = sheet.getContext("2d");
     ctx.fillStyle = "#0C120E";
     ctx.fillRect(0, 0, sheet.width, sheet.height);
@@ -1089,10 +1304,28 @@ export default function SwingTracer() {
       const cx = pad + (i % cols) * (cw + pad);
       const cy = headerH + pad + Math.floor(i / cols) * (ch + labelH + pad);
       ctx.drawImage(cell.canvas, cx, cy);
-      ctx.fillStyle = "#EDF2EA";
+      // short label, clipped to its own tile so it can never overstrike a
+      // neighbor; the footer carries the long annotation
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(cx, cy + ch, cw, labelH);
+      ctx.clip();
+      ctx.fillStyle = cell.isImpactHint ? "#F2C14E" : "#EDF2EA";
       ctx.font = "600 18px ui-monospace, Menlo, monospace";
-      ctx.fillText(cell.label, cx + 6, cy + ch + 24);
+      ctx.fillText(
+        `Frame ${cell.index} of ${cells.length} — ${fmt(cell.t)} (${cell.fps}fps)` +
+          (cell.isImpactHint ? " ★ est. impact" : ""),
+        cx + 6,
+        cy + ch + 24
+      );
+      ctx.restore();
     });
+    if (footerLines.length) {
+      ctx.fillStyle = "#F2C14E";
+      ctx.font = footerFont;
+      const fy = headerH + rows * (ch + labelH + pad) + pad;
+      footerLines.forEach((l, li) => ctx.fillText(l, pad + 2, fy + (li + 1) * footerLineH - 4));
+    }
     return sheet;
   };
 
@@ -1400,7 +1633,7 @@ export default function SwingTracer() {
             </div>
             <p className="hint" style={{ maxWidth: 420, margin: "8px auto 0" }}>
               Film from down the line (camera at hand height, on the target line) or face on (camera at chest height, square to you).
-              Slow-mo clips from your phone work great — the frame stepper assumes the FPS you pick below.
+              Slow-mo or normal clips from your phone both work great — the frame rate is detected automatically when the clip loads.
             </p>
             <p className="hint mono" style={{ marginTop: 10, color: hevcOk ? "var(--green)" : "var(--amber)" }}>
               {hevcOk
@@ -1522,9 +1755,19 @@ export default function SwingTracer() {
                 <select value={speed} onChange={(e) => setSpeed(parseFloat(e.target.value))}>
                   {SPEEDS.map((s) => <option key={s} value={s}>{s}×</option>)}
                 </select>
-                <label className="hint">Clip FPS</label>
-                <select value={fps} onChange={(e) => setFps(parseInt(e.target.value))}>
-                  {FPS_OPTIONS.map((f) => <option key={f} value={f}>{f}</option>)}
+                <label className="hint">
+                  Clip FPS{fpsSource === "detected" ? " · auto" : fpsSource === "manual" ? " · manual" : ""}
+                </label>
+                <select
+                  value={fps}
+                  onChange={(e) => {
+                    fpsManualRef.current = true;
+                    setFpsSource("manual");
+                    setFps(parseInt(e.target.value));
+                  }}
+                  title={fpsSource === "detected" ? "Detected from the clip — change only if it looks wrong" : undefined}
+                >
+                  {[...new Set([fps, ...FPS_OPTIONS])].sort((a, b) => a - b).map((f) => <option key={f} value={f}>{f}</option>)}
                 </select>
                 <span style={{ flex: 1 }} />
                 <button
