@@ -715,20 +715,25 @@ export default function SwingTracer() {
   };
 
   // Shared frame selection for the downloadable frame sheet, the chat-export
-  // prompt, and the AI Coach direct-analysis path — built around an explicit
-  // coverage spec (see project notes) rather than a single content-driven
-  // heuristic, since relying purely on "distinct from last kept" proved it
-  // can walk past exactly the moment that matters (motion blur at impact
-  // can make a fast transition look LESS different than a slower one
-  // elsewhere). The guarantees:
-  //  - no gap anywhere wider than 25% of the marked swing duration
-  //  - the final 35% of the window (impact lives here for any plausible
-  //    tempo) sampled at <=0.08s spacing regardless of content, so
-  //    coverage there never depends on correctly guessing where impact is
-  //  - a frame in the first/last 5% of the window (address/finish)
-  //  - 12-18 frames total
-  //  - every timestamp snapped to an actual source frame (given the
-  //    declared fps), not an arbitrary fractional second
+  // prompt, and the AI Coach direct-analysis path. History of this function:
+  // pure content-driven selection missed impact (motion blur suppresses
+  // pixel-diff there); anchoring a dense zone to the END of the window
+  // wasted frames on follow-through when the motion-peak impact estimate
+  // fired late (follow-through is the largest sustained motion, so peak
+  // errors skew late — observed +0.28s on a real clip). Current design:
+  //  1. motion peak is only a SEARCH HINT for impact
+  //  2. impact refined by ball-departure: find the static-early/changed-late
+  //     region (the ball on its tee), then locate the frame boundary where
+  //     it leaves; motion peak used alone only when no ball is detectable
+  //  3. dense sampling window is ASYMMETRIC around the estimate
+  //     (impact−0.35s → impact+0.05s) since errors skew late
+  //  4. ≤3 frames after estimated impact (release / mid / finish) — the
+  //     downswing is what analysis needs, not twelve follow-through poses
+  //  5. estimate-independent hard rules enforced LAST, so they hold even
+  //     when every estimate above is wrong: no gap >0.10s inside the
+  //     40–85% region of the marked window, no gap >25% of the window
+  //     anywhere, ≥12 frames; results of these checks logged per sheet
+  //  6. every timestamp snapped to a real source frame at the declared fps
   const getExportFrames = async (v, maxCount = 18) => {
     // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
     // fall back to the whole clip rather than guessing at where the swing is
@@ -738,131 +743,220 @@ export default function SwingTracer() {
     const frameDur = 1 / (fps || 30);
     const snap = (t) => Math.min(end, Math.max(start, Math.round(t / frameDur) * frameDur));
 
-    const W = 96;
-    const H = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * W) || 54);
-    const c = document.createElement("canvas");
-    c.width = W;
-    c.height = H;
-    const ctx = c.getContext("2d", { willReadFrequently: true });
-
-    // ---- C2: dense, structural coverage of the final 35% of the window.
-    // Fixed spacing regardless of content — this is what guarantees impact
-    // is covered even if our own motion-diff guess at where it is turns
-    // out wrong, rather than betting everything on that guess being right.
-    const ZONE_FRAC = 0.35;
-    const DENSE_STEP = 0.075; // margin under the 0.08s hard limit
-    const zoneStart = start + (1 - ZONE_FRAC) * span;
-    const denseCount = Math.max(6, Math.ceil((end - zoneStart) / DENSE_STEP) + 1);
-    const denseTimes = Array.from({ length: denseCount }, (_, i) =>
-      snap(zoneStart + (i / (denseCount - 1)) * (end - zoneStart))
-    );
-    const denseData = [];
-    for (const t of denseTimes) denseData.push(await sampleLuma(t, W, H, ctx));
-    const denseDiffs = [0];
-    for (let i = 1; i < denseData.length; i++) denseDiffs.push(diffOf(denseData[i], denseData[i - 1]));
-    let peakDenseIdx = 1;
-    for (let i = 2; i < denseDiffs.length; i++) if (denseDiffs[i] > denseDiffs[peakDenseIdx]) peakDenseIdx = i;
-    const denseSorted = [...denseDiffs].sort((a, b) => a - b);
-    const denseMedian = denseSorted[Math.floor(denseSorted.length / 2)] || 0.001;
-    // rough, honest confidence note per the "treat as hint" requirement —
-    // not a real detector, just how sharply the peak stands out locally
-    const impactHintT = denseTimes[peakDenseIdx];
-    const impactConfidence =
-      denseDiffs[peakDenseIdx] / denseMedian > 3
-        ? "moderate (clear local motion spike)"
-        : "low (no sharp motion spike found — clip may be noisy or low-contrast)";
-
-    // ---- C1: content-driven sparse coverage before the dense zone, with a
-    // hard ceiling on gap size regardless of content (25% of total window)
-    const SPARSE_CANDIDATES = 60;
-    const sparseTimes = Array.from({ length: SPARSE_CANDIDATES }, (_, i) =>
-      start + (i / (SPARSE_CANDIDATES - 1)) * (zoneStart - start)
-    );
-    const sparseData = [];
-    for (const t of sparseTimes) sparseData.push(await sampleLuma(t, W, H, ctx));
-    const sparseDiffs = [0];
-    for (let i = 1; i < sparseData.length; i++) sparseDiffs.push(diffOf(sparseData[i], sparseData[i - 1]));
-    const sparseSorted = [...sparseDiffs].sort((a, b) => a - b);
-    const sparseMedian = sparseSorted[Math.floor(sparseSorted.length / 2)] || 0.001;
-
-    const greedyKeep = (thresh) => {
-      const idx = [0];
-      let lastKeptData = sparseData[0];
-      for (let i = 1; i < sparseTimes.length; i++) {
-        if (diffOf(sparseData[i], lastKeptData) > thresh) {
-          idx.push(i);
-          lastKeptData = sparseData[i];
-        }
-      }
-      return idx;
+    const mkCtx = (w) => {
+      const h = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * w) || Math.round(w * 0.5625));
+      const cv = document.createElement("canvas");
+      cv.width = w;
+      cv.height = h;
+      return { ctx: cv.getContext("2d", { willReadFrequently: true }), w, h };
     };
-    const keptIdx = greedyKeep(Math.max(sparseMedian * 1.5, 1e-6));
-    let sparseSel = keptIdx.map((i) => sparseTimes[i]);
-    if (!sparseSel.includes(start)) sparseSel.unshift(start);
+    const lo = mkCtx(96); // coarse motion scan
+    const hi = mkCtx(192); // ball ROI work — the ball is tiny at 96px
 
-    // hard max-gap ceiling — bridge with midpoints wherever content-driven
-    // selection alone leaves too wide a stretch, including the gap into
-    // the dense zone (zoneStart acts as a temporary sentinel for that)
-    const maxGap = 0.25 * span;
-    sparseSel.push(zoneStart);
-    let changed = true;
-    let guard = 0;
-    while (changed && guard < 50) {
-      changed = false;
-      for (let i = 0; i < sparseSel.length - 1; i++) {
-        if (sparseSel[i + 1] - sparseSel[i] > maxGap) {
-          sparseSel.splice(i + 1, 0, (sparseSel[i] + sparseSel[i + 1]) / 2);
-          changed = true;
-          break;
+    // ---- pass 1: coarse motion scan over the whole window → peak = hint ----
+    const N = 48;
+    const scanTimes = Array.from({ length: N }, (_, i) => snap(start + (i / (N - 1)) * span));
+    const scanData = [];
+    for (const t of scanTimes) scanData.push(await sampleLuma(t, lo.w, lo.h, lo.ctx));
+    const scanDiffs = [0];
+    for (let i = 1; i < N; i++) scanDiffs.push(diffOf(scanData[i], scanData[i - 1]));
+    let peakI = 1;
+    for (let i = 2; i < N; i++) if (scanDiffs[i] > scanDiffs[peakI]) peakI = i;
+    const peakT = scanTimes[peakI];
+    const scanSorted = [...scanDiffs].sort((a, b) => a - b);
+    const scanMedian = scanSorted[Math.floor(scanSorted.length / 2)] || 0.001;
+    const peakSharp = scanDiffs[peakI] / scanMedian;
+
+    // ---- pass 2: find the ball — static through the early window (golfer
+    // moves, ball doesn't), permanently changed by the end (ball gone).
+    // Block-level scoring; restricted to the lower 60% of the frame since
+    // the ball sits at ground/tee height.
+    const BLOCK = 16;
+    const avgBlockDiff = (a, b, bx, by) => {
+      let sum = 0, n = 0;
+      for (let y = by; y < Math.min(by + BLOCK, hi.h); y++)
+        for (let x = bx; x < Math.min(bx + BLOCK, hi.w); x++) {
+          const p = (y * hi.w + x) * 4;
+          sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
+          n++;
+        }
+      return n ? sum / n : 0;
+    };
+    const earlyTimes = Array.from({ length: 6 }, (_, i) => snap(start + (i / 5) * 0.35 * span));
+    const lateTimes = Array.from({ length: 3 }, (_, i) => snap(end - (i / 2) * 0.06 * span));
+    const earlyFrames = [];
+    for (const t of earlyTimes) earlyFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+    const lateFrames = [];
+    for (const t of lateTimes) lateFrames.push(await sampleLuma(t, hi.w, hi.h, hi.ctx));
+    const earlyMean = new Float32Array(earlyFrames[0].length);
+    for (const f of earlyFrames) for (let p = 0; p < f.length; p++) earlyMean[p] += f[p] / earlyFrames.length;
+    const lateMean = new Float32Array(lateFrames[0].length);
+    for (const f of lateFrames) for (let p = 0; p < f.length; p++) lateMean[p] += f[p] / lateFrames.length;
+
+    let ball = null; // { bx, by, lateChange }
+    {
+      const cands = [];
+      for (let by = Math.floor(hi.h * 0.4 / BLOCK) * BLOCK; by < hi.h; by += BLOCK) {
+        for (let bx = 0; bx < hi.w; bx += BLOCK) {
+          let earlyVar = 0;
+          for (const f of earlyFrames) earlyVar = Math.max(earlyVar, avgBlockDiff(f, earlyMean, bx, by));
+          const lateChange = avgBlockDiff(earlyMean, lateMean, bx, by);
+          cands.push({ bx, by, earlyVar, lateChange });
         }
       }
-      guard++;
+      const lcSorted = cands.map((x) => x.lateChange).sort((a, b) => a - b);
+      const lcMedian = lcSorted[Math.floor(lcSorted.length / 2)] || 0.001;
+      const best = cands
+        .filter((x) => x.lateChange > Math.max(3 * lcMedian, 8) && x.earlyVar < 0.3 * x.lateChange)
+        .sort((a, b) => b.lateChange - a.lateChange)[0];
+      if (best) ball = best;
     }
-    sparseSel.pop(); // drop the zoneStart sentinel — denseTimes already starts there
 
-    // ---- merge, frame-snap, dedupe, sort ----
-    let allTimes = [...sparseSel, ...denseTimes].map(snap);
-    allTimes = [...new Set(allTimes)].sort((a, b) => a - b);
-    // small tolerance so frame-snapping the boundary sample slightly earlier
-    // than the nominal zoneStart can't misclassify it as "sparse" and make
-    // it eligible for thinning
-    const isDense = (t) => t >= zoneStart - frameDur / 2;
-
-    // ---- C5: 12-18 total. Dense zone (C2) is never touched by either
-    // direction — it's the one guarantee we don't trade away.
-    while (allTimes.length > maxCount) {
-      let bestI = -1, bestGap = Infinity;
-      for (let i = 0; i < allTimes.length - 1; i++) {
-        if (isDense(allTimes[i]) || isDense(allTimes[i + 1])) continue;
-        const gap = allTimes[i + 1] - allTimes[i];
-        if (gap < bestGap) { bestGap = gap; bestI = i; }
+    // ---- pass 3: ball-departure search. Window skews EARLY of the motion
+    // peak because peak errors skew late (follow-through dominates motion).
+    let impactT = peakT;
+    let impactMethod = `motion peak only (no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
+    if (ball) {
+      const sStart = Math.max(start, peakT - 0.5);
+      const sEnd = Math.min(end, peakT + 0.1);
+      const step = Math.max(frameDur, (sEnd - sStart) / 40); // frame-accurate unless that exceeds 40 seeks
+      const half = ball.lateChange * 0.5;
+      let found = null;
+      let run = 0;
+      for (let t = sStart; t <= sEnd + 1e-6; t += step) {
+        const f = await sampleLuma(snap(t), hi.w, hi.h, hi.ctx);
+        const d = avgBlockDiff(f, earlyMean, ball.bx, ball.by);
+        if (d > half) {
+          run++;
+          if (run === 1) found = snap(t);
+          if (run >= 3) break; // departed and stayed departed — that's impact
+        } else {
+          run = 0;
+          found = null;
+        }
       }
-      if (bestI === -1) break; // nothing left outside the dense zone to safely thin
-      allTimes.splice(bestI + 1, 1);
+      if (found != null && run >= 3) {
+        const delta = peakT - found;
+        impactT = found;
+        impactMethod =
+          `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
+          (Math.abs(delta) > 0.06 ? "rejected" : "agreed");
+      }
     }
-    while (allTimes.length < 12) {
+
+    // ---- assemble: asymmetric dense window around the impact estimate ----
+    const DENSE_STEP = 0.075;
+    const denseStart = Math.max(start, impactT - 0.35);
+    const denseEnd = Math.min(end, impactT + 0.05);
+    const denseN = Math.max(2, Math.ceil((denseEnd - denseStart) / DENSE_STEP) + 1);
+    const denseTimes = Array.from({ length: denseN }, (_, i) =>
+      snap(denseStart + (i / (denseN - 1)) * (denseEnd - denseStart))
+    );
+
+    // content-driven sparse coverage before the dense window, from the scan
+    // we already have (no extra seeks)
+    const sparse = [start];
+    let lastKept = scanData[0];
+    for (let i = 1; i < N; i++) {
+      if (scanTimes[i] >= denseStart) break;
+      if (diffOf(scanData[i], lastKept) > scanMedian * 1.5) {
+        sparse.push(scanTimes[i]);
+        lastKept = scanData[i];
+      }
+    }
+
+    let times = [...new Set([...sparse, ...denseTimes, snap(end)].map(snap))].sort((a, b) => a - b);
+
+    // ---- rule 4: at most 3 frames after estimated impact — release, mid
+    // follow-through, finish hold. (Estimate-independent coverage rules run
+    // AFTER this and may re-insert if the 40-85% region demands it.)
+    {
+      const post = times.filter((t) => t > impactT + frameDur / 2);
+      if (post.length > 3) {
+        const keep = new Set([post[0], post[Math.floor(post.length / 2)], post[post.length - 1]]);
+        times = times.filter((t) => t <= impactT + frameDur / 2 || keep.has(t));
+      }
+    }
+
+    // ---- hard, estimate-independent coverage rules (enforced last so they
+    // hold even if every estimate above was wrong) ----
+    const regionA = start + 0.4 * span;
+    const regionB = start + 0.85 * span;
+    const violation = (a, b) => {
+      if (b - a > 0.25 * span) return true; // global ceiling
+      const inRegion = Math.min(b, regionB) - Math.max(a, regionA);
+      return inRegion > 0.1; // core-of-swing ceiling
+    };
+    for (let guard = 0; guard < 80; guard++) {
+      let worstI = -1, worstGap = -1;
+      for (let i = 0; i < times.length - 1; i++) {
+        if (violation(times[i], times[i + 1]) && times[i + 1] - times[i] > worstGap) {
+          worstGap = times[i + 1] - times[i];
+          worstI = i;
+        }
+      }
+      if (worstI === -1) break;
+      const mid = snap((times[worstI] + times[worstI + 1]) / 2);
+      if (mid <= times[worstI] || mid >= times[worstI + 1]) break; // can't split further at this fps
+      times.splice(worstI + 1, 0, mid);
+    }
+
+    // ---- count floor/ceiling. Floor pads the downswing (pre-impact side of
+    // the dense window). Ceiling thins only where no rule breaks; accepts
+    // running slightly over maxCount rather than violating coverage.
+    while (times.length < 12) {
       let bestI = -1, bestGap = -1;
-      for (let i = 0; i < allTimes.length - 1; i++) {
-        if (isDense(allTimes[i + 1])) continue;
-        const gap = allTimes[i + 1] - allTimes[i];
+      for (let i = 0; i < times.length - 1; i++) {
+        if (times[i + 1] > impactT + frameDur / 2) continue;
+        const gap = times[i + 1] - times[i];
         if (gap > bestGap) { bestGap = gap; bestI = i; }
       }
       if (bestI === -1) break;
-      allTimes.splice(bestI + 1, 0, snap((allTimes[bestI] + allTimes[bestI + 1]) / 2));
+      const mid = snap((times[bestI] + times[bestI + 1]) / 2);
+      if (mid <= times[bestI] || mid >= times[bestI + 1]) break;
+      times.splice(bestI + 1, 0, mid);
     }
-    allTimes = [...new Set(allTimes)].sort((a, b) => a - b);
+    while (times.length > maxCount) {
+      let removed = false;
+      let bestI = -1, bestGap = Infinity;
+      for (let i = 1; i < times.length - 1; i++) {
+        if (Math.abs(times[i] - impactT) < frameDur / 2) continue; // never drop the impact frame
+        if (violation(times[i - 1], times[i + 1])) continue; // removal would break coverage
+        const gap = times[i + 1] - times[i - 1];
+        if (gap < bestGap) { bestGap = gap; bestI = i; }
+      }
+      if (bestI !== -1) { times.splice(bestI, 1); removed = true; }
+      if (!removed) break; // coverage rules outrank the count cap
+    }
+    times = [...new Set(times)].sort((a, b) => a - b);
 
-    return allTimes.map((t, i) => {
-      const isImpactHint = Math.abs(t - impactHintT) < frameDur / 2;
+    // mechanical verification of the hard rules on every sheet — this line
+    // is the acceptance test; if a bad sheet ever ships, this says why
+    {
+      let maxAny = 0, maxCore = 0;
+      for (let i = 0; i < times.length - 1; i++) {
+        maxAny = Math.max(maxAny, times[i + 1] - times[i]);
+        maxCore = Math.max(maxCore, Math.min(times[i + 1], regionB) - Math.max(times[i], regionA));
+      }
+      console.info(
+        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} · ` +
+          `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
+          `max 40-85% gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10) · ` +
+          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 ? "PASS" : "FAIL"}`
+      );
+    }
+
+    return times.map((t, i) => {
+      const isImpactHint = Math.abs(t - impactT) < frameDur / 2;
       return {
         t,
         index: i + 1,
         fps,
         isImpactHint,
-        impactConfidence: isImpactHint ? impactConfidence : null,
+        impactConfidence: isImpactHint ? impactMethod : null,
         label:
-          `Frame ${i + 1} of ${allTimes.length} — ${fmt(t)} (${fps}fps)` +
-          (isImpactHint ? ` [estimated impact — motion peak, confidence: ${impactConfidence}; treat as a hint, not truth]` : ""),
+          `Frame ${i + 1} of ${times.length} — ${fmt(t)} (${fps}fps)` +
+          (isImpactHint ? ` [estimated impact — ${impactMethod}; treat as a hint, not truth]` : ""),
       };
     });
   };
