@@ -1167,9 +1167,37 @@ export default function SwingTracer() {
     const labelH = 34;
     const headerH = 30;
     const pad = 6;
+
+    // Long annotations (the impact-method string) live in a sheet-level
+    // footer; tiles carry only a short marker. Drawing the full string on
+    // the tile overflowed into the neighboring tile and rendered as
+    // garbled overstrike.
+    const impactCell = cells.find((c) => c.isImpactHint);
+    const footerFont = "500 14px ui-monospace, Menlo, monospace";
+    const footerLineH = 19;
+    const footerLines = [];
+    if (impactCell) {
+      const meas = document.createElement("canvas").getContext("2d");
+      meas.font = footerFont;
+      const text =
+        `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — estimated impact: ` +
+        `${impactCell.impactConfidence}. Treat as a hint, not truth.`;
+      const maxW = cols * cw + (cols - 1) * pad - 4;
+      let line = "";
+      for (const word of text.split(" ")) {
+        const probe = line ? `${line} ${word}` : word;
+        if (line && meas.measureText(probe).width > maxW) {
+          footerLines.push(line);
+          line = word;
+        } else line = probe;
+      }
+      if (line) footerLines.push(line);
+    }
+    const footerH = footerLines.length ? footerLines.length * footerLineH + pad * 2 : 0;
+
     const sheet = document.createElement("canvas");
     sheet.width = cols * cw + (cols + 1) * pad;
-    sheet.height = headerH + rows * (ch + labelH + pad) + pad;
+    sheet.height = headerH + rows * (ch + labelH + pad) + pad + footerH;
     const ctx = sheet.getContext("2d");
     ctx.fillStyle = "#0C120E";
     ctx.fillRect(0, 0, sheet.width, sheet.height);
@@ -1186,10 +1214,28 @@ export default function SwingTracer() {
       const cx = pad + (i % cols) * (cw + pad);
       const cy = headerH + pad + Math.floor(i / cols) * (ch + labelH + pad);
       ctx.drawImage(cell.canvas, cx, cy);
-      ctx.fillStyle = "#EDF2EA";
+      // short label, clipped to its own tile so it can never overstrike a
+      // neighbor; the footer carries the long annotation
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(cx, cy + ch, cw, labelH);
+      ctx.clip();
+      ctx.fillStyle = cell.isImpactHint ? "#F2C14E" : "#EDF2EA";
       ctx.font = "600 18px ui-monospace, Menlo, monospace";
-      ctx.fillText(cell.label, cx + 6, cy + ch + 24);
+      ctx.fillText(
+        `Frame ${cell.index} of ${cells.length} — ${fmt(cell.t)} (${cell.fps}fps)` +
+          (cell.isImpactHint ? " ★ est. impact" : ""),
+        cx + 6,
+        cy + ch + 24
+      );
+      ctx.restore();
     });
+    if (footerLines.length) {
+      ctx.fillStyle = "#F2C14E";
+      ctx.font = footerFont;
+      const fy = headerH + rows * (ch + labelH + pad) + pad;
+      footerLines.forEach((l, li) => ctx.fillText(l, pad + 2, fy + (li + 1) * footerLineH - 4));
+    }
     return sheet;
   };
 
