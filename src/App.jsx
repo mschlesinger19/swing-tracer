@@ -4,13 +4,13 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 /* Content: checkpoints, faults, drills                                */
 /* ------------------------------------------------------------------ */
 
+// Only the swing's bounds are marked directly — everything in between is
+// sampled automatically for export (see getExportFrames). The individual
+// P-position checkpoints referenced in CHECKPOINTS/FAULTS below are still
+// useful instructional reference text; they just aren't separately marked.
 const POSITIONS = [
-  { id: "p1", label: "P1 · Setup" },
-  { id: "p2", label: "P2 · Takeaway" },
-  { id: "p4", label: "P4 · Top" },
-  { id: "p6", label: "P6 · Delivery" },
-  { id: "p7", label: "P7 · Impact" },
-  { id: "p10", label: "P10 · Finish" },
+  { id: "p1", label: "Swing start" },
+  { id: "p10", label: "Swing end" },
 ];
 
 const CHECKPOINTS = {
@@ -321,10 +321,6 @@ export default function SwingTracer() {
   const [aiResult, setAiResult] = useState(null);
   const [aiError, setAiError] = useState("");
   const [exportState, setExportState] = useState("idle"); // idle | working | done | copied
-  const [detectState, setDetectState] = useState("idle"); // idle | working | done | warn
-  const [detectMsg, setDetectMsg] = useState("");
-  const [detectTrace, setDetectTrace] = useState(null); // motion curve + placements for debugging
-  const [suggested, setSuggested] = useState({}); // position ids that are auto-detected, not yet confirmed
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
   });
@@ -399,9 +395,14 @@ export default function SwingTracer() {
     }
   };
 
+  // true while a frame-capture pass (export or AI analysis) is seeking
+  // through the video — playback/frame-stepping must stay off the video
+  // element while that has exclusive control of it
+  const busy = exportState === "working" || aiState === "capturing" || aiState === "analyzing";
+
   const togglePlay = () => {
     const v = videoRef.current;
-    if (!v || detectState === "working") return;
+    if (!v || busy) return;
     if (v.paused) {
       v.playbackRate = speed;
       v.play();
@@ -410,7 +411,7 @@ export default function SwingTracer() {
 
   const step = (dir) => {
     const v = videoRef.current;
-    if (!v || detectState === "working") return;
+    if (!v || busy) return;
     v.pause();
     v.currentTime = Math.min(Math.max(0, v.currentTime + dir / fps), duration || 0);
   };
@@ -702,172 +703,81 @@ export default function SwingTracer() {
     return ctx.getImageData(0, 0, w, h).data;
   };
 
-  const autoDetect = async () => {
-    const v = videoRef.current;
-    if (!v || !duration) return;
-    v.pause();
-    const resumeT = v.currentTime;
-    setDetectState("working");
-    setDetectMsg("Scanning motion…");
-    try {
-      const W = 96;
-      const H = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * W) || 54);
-      const c = document.createElement("canvas");
-      c.width = W;
-      c.height = H;
-      const ctx = c.getContext("2d", { willReadFrequently: true });
+  // shared pixel-diff metric — average per-pixel change (R+B channels) between
+  // two same-size frame captures. Used by the keyframe-style dedup in
+  // getExportFrames below.
+  const diffOf = (a, b) => {
+    let sum = 0;
+    for (let p = 0; p < a.length; p += 4) sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
+    return sum / (a.length / 4);
+  };
 
-      // coarse pass: build the motion curve
-      const N = Math.min(72, Math.max(36, Math.round(duration * 12)));
-      const end = Math.max(0.01, duration - 0.01);
-      const times = Array.from({ length: N }, (_, i) => (i / (N - 1)) * end);
-      const diffOf = (a, b) => {
-        let sum = 0;
-        for (let p = 0; p < a.length; p += 4) sum += Math.abs(a[p] - b[p]) + Math.abs(a[p + 2] - b[p + 2]);
-        return sum / (a.length / 4);
-      };
-      // if playback somehow starts mid-detection, stop cleanly instead of fighting it
-      const assertPaused = () => {
-        const vv = videoRef.current;
-        if (!vv || !vv.paused) throw new Error("DETECT_CANCELLED");
-      };
+  // Shared frame selection for the downloadable frame sheet, the chat-export
+  // prompt, and the AI Coach direct-analysis path. Precise P-position labels
+  // turned out not to matter for a vision-capable AI reading a swing — it
+  // can tell address from impact from finish on sight. What matters is
+  // marking the swing's actual start and end (tap P1 and P10 in Mark mode);
+  // everything between them is filled by keyframe-style dedup — walk the
+  // real pixel content and keep a frame only when it looks meaningfully
+  // different from the last one kept, so fast stretches (the downswing)
+  // naturally get more frames and static holds (address, the finish) get
+  // collapsed to one or two, capped at maxCount.
+  const getExportFrames = async (v, maxCount = 14) => {
+    // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
+    // fall back to the whole clip rather than guessing at where the swing is
+    const start = markers.p1 ?? 0;
+    const end = markers.p10 ?? duration;
 
-      let prev = null;
-      const motion = [];
-      for (let i = 0; i < N; i++) {
-        assertPaused();
-        const data = await sampleLuma(times[i], W, H, ctx);
-        motion.push(prev ? diffOf(data, prev) : 0);
-        prev = data;
-      }
-      motion[0] = motion[1] || 0;
+    const CANDIDATES = 90;
+    const candTimes = Array.from({ length: CANDIDATES }, (_, i) => start + (i / (CANDIDATES - 1)) * (end - start));
+    const W = 96;
+    const H = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * W) || 54);
+    const c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
 
-      // light smoothing
-      const sm = motion.map((_, i) => {
-        const a = Math.max(0, i - 1), b = Math.min(motion.length - 1, i + 1);
-        let s = 0;
-        for (let j = a; j <= b; j++) s += motion[j];
-        return s / (b - a + 1);
-      });
-
-      const peakVal = Math.max(...sm);
-      const peakIdx = sm.indexOf(peakVal);
-      const quiet = peakVal * 0.12;
-
-      // P4: deepest valley before impact (skip the very start)
-      let p4Idx = -1, p4Val = Infinity;
-      for (let i = Math.max(1, Math.floor(peakIdx * 0.25)); i < peakIdx; i++) {
-        if (sm[i] < p4Val) { p4Val = sm[i]; p4Idx = i; }
-      }
-
-      // P1: last quiet frame before sustained motion begins
-      let p1Idx = 0;
-      const stopAt = p4Idx > 0 ? p4Idx : peakIdx;
-      for (let i = 0; i < stopAt; i++) {
-        if (sm[i] <= quiet) p1Idx = i;
-        else if (sm[i] > peakVal * 0.3 && i > 2) break;
-      }
-
-      // P10: motion settles after impact
-      let p10Idx = N - 1;
-      for (let i = peakIdx + 2; i < N - 1; i++) {
-        if (sm[i] < peakVal * 0.18 && sm[i + 1] < peakVal * 0.18) { p10Idx = i; break; }
-      }
-
-      // fine passes around impact (max motion) and top (min motion)
-      setDetectMsg("Refining impact and top…");
-      const stepT = times[1] - times[0];
-      const finePass = async (centerT, wantMax) => {
-        const S = 9;
-        const ts = Array.from({ length: S }, (_, i) =>
-          Math.min(Math.max(0, centerT - stepT + (i / (S - 1)) * 2 * stepT), end)
-        );
-        let prevD = null, best = { t: centerT, m: wantMax ? -1 : Infinity };
-        for (const t of ts) {
-          assertPaused();
-          const d = await sampleLuma(t, W, H, ctx);
-          if (prevD) {
-            const m = diffOf(d, prevD);
-            if (wantMax ? m > best.m : m < best.m) best = { t, m };
-          }
-          prevD = d;
-        }
-        return best.t;
-      };
-      const p7T = await finePass(times[peakIdx], true);
-      const p4T = p4Idx > 0 ? await finePass(times[p4Idx], false) : null;
-
-      const p1T = times[p1Idx];
-      const p10T = times[p10Idx];
-      const found = { p1: p1T, p7: p7T, p10: p10T };
-      if (p4T != null && p4T > p1T && p4T < p7T) {
-        found.p4 = p4T;
-        found.p2 = p1T + 0.45 * (p4T - p1T); // interpolated
-        found.p6 = p4T + 0.75 * (p7T - p4T); // interpolated
-      }
-
-      // validity: a real swing means the top and finish frames look very
-      // different from address. If they don't, we found a waggle, not a swing.
-      const med = [...sm].sort((a, b) => a - b)[Math.floor(sm.length / 2)];
-      const fAddr = await sampleLuma(p1T, W, H, ctx);
-      const fTop = await sampleLuma(found.p4 ?? (p1T + p7T) / 2, W, H, ctx);
-      const fFin = await sampleLuma(Math.max(p10T - 0.05, p7T), W, H, ctx);
-      const noiseFloor = Math.max(1e-6, med);
-      const swingVisible =
-        diffOf(fAddr, fTop) > 3 * noiseFloor || diffOf(fAddr, fFin) > 3 * noiseFloor;
-
-      const confident =
-        swingVisible &&
-        peakVal / noiseFloor > 3 &&
-        found.p4 != null &&
-        p1T < found.p4 && found.p4 < p7T && p7T < p10T &&
-        p4Val < peakVal * 0.6;
-
-      // never overwrite a confirmed manual mark — only fill empty or still-suggested chips
-      const keepManual = (k) => markers[k] != null && !suggested[k];
-      const applied = {};
-      Object.entries(found).forEach(([k, t]) => {
-        if (!keepManual(k)) applied[k] = t;
-      });
-      const preservedCount = Object.keys(found).length - Object.keys(applied).length;
-
-      setMarkers((m) => ({ ...m, ...applied }));
-      setSuggested((s) => ({
-        ...s,
-        ...Object.keys(applied).reduce((acc, k) => ({ ...acc, [k]: true }), {}),
-      }));
-      v.currentTime = applied.p7 ?? markers.p7 ?? found.p7;
-      setDetectState(confident ? "done" : "warn");
-      setDetectTrace({
-        times,
-        sm,
-        peakVal,
-        quiet,
-        settle: peakVal * 0.18,
-        found,
-        stats: `peak ${(peakVal / noiseFloor).toFixed(1)}× median · impact ${fmt(p7T)} · top ${found.p4 != null ? fmt(found.p4) : "—"} · finish ${fmt(p10T)}${swingVisible ? "" : " · swing NOT visually confirmed"}`,
-      });
-      const preservedNote = preservedCount
-        ? ` Kept ${preservedCount} manually confirmed mark${preservedCount > 1 ? "s" : ""} untouched.`
-        : "";
-      setDetectMsg(
-        (!swingVisible
-          ? "⚠ These are probably wrong — the frames at the detected top and finish look identical to address, which means I found pre-shot movement (a waggle or regrip), not the swing. Scrub the timeline: if the swing is in the clip, note where impact is and trim the dead time before re-detecting; if the clip ends before the swing, re-export it."
-          : confident
-          ? "Positions suggested (amber = unconfirmed). Tap a chip to jump there, frame-step to check, and re-mark anything that's off — P2 and P6 are interpolated, so eyeball those two especially."
-          : "⚠ Low confidence — the motion pattern looked unusual (camera shake, a waggle, or movement in the background). Best guesses are placed, but double-check every chip before exporting or analyzing.") +
-          preservedNote
-      );
-    } catch (err) {
-      if (String(err?.message).includes("DETECT_CANCELLED")) {
-        setDetectState("idle");
-        setDetectMsg("Detection stopped — the video started playing mid-scan. Pause and tap ⚡ Auto-detect again.");
-      } else {
-        setDetectState("warn");
-        setDetectMsg("Detection failed: " + String(err?.message || err) + ". Mark positions manually.");
-      }
-      if (videoRef.current) videoRef.current.currentTime = resumeT;
+    const rawData = [];
+    const diffs = [0];
+    let prev = null;
+    for (const t of candTimes) {
+      const data = await sampleLuma(t, W, H, ctx);
+      rawData.push(data);
+      if (prev) diffs.push(diffOf(data, prev));
+      prev = data;
     }
+    // threshold adapts to this clip's own noise floor rather than a fixed
+    // magic number, since contrast/lighting/distance vary a lot by footage
+    const sortedDiffs = [...diffs].sort((a, b) => a - b);
+    const median = sortedDiffs[Math.floor(sortedDiffs.length / 2)] || 0.001;
+    const distinctThresh = Math.max(median * 1.5, 1e-6);
+
+    // greedy keep: compare each candidate to the last KEPT frame (not just
+    // the previous candidate), so slow, steady drift across many small
+    // steps still eventually triggers a keep once it accumulates enough
+    // real change
+    const keptIdx = [0];
+    let lastKeptData = rawData[0];
+    for (let i = 1; i < candTimes.length; i++) {
+      if (diffOf(rawData[i], lastKeptData) > distinctThresh) {
+        keptIdx.push(i);
+        lastKeptData = rawData[i];
+      }
+    }
+    if (keptIdx[keptIdx.length - 1] !== candTimes.length - 1) keptIdx.push(candTimes.length - 1);
+
+    // safety cap in case a noisy clip triggers far more "distinct" frames
+    // than is useful — keep an even subset rather than truncating the tail
+    let finalIdx = keptIdx;
+    if (finalIdx.length > maxCount) {
+      finalIdx = Array.from(
+        { length: maxCount },
+        (_, i) => keptIdx[Math.round((i * (keptIdx.length - 1)) / (maxCount - 1))]
+      );
+    }
+
+    const times = finalIdx.map((i) => candTimes[i]);
+    return times.map((t, i) => ({ label: `Frame ${i + 1} of ${times.length} — ${fmt(t)}`, t }));
   };
 
   const exportFrameSheet = async () => {
@@ -877,16 +787,7 @@ export default function SwingTracer() {
     const resumeT = v.currentTime;
     setExportState("working");
     try {
-      const marked = POSITIONS.filter((p) => markers[p.id] != null).map((p) => ({
-        label: p.label,
-        t: markers[p.id],
-      }));
-      const frames = marked.length
-        ? marked
-        : [0.02, 0.2, 0.4, 0.55, 0.7, 0.92].map((f, i) => ({
-            label: `Frame ${i + 1}`,
-            t: f * duration,
-          }));
+      const frames = await getExportFrames(v);
       const cells = [];
       for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t, 640) });
       v.currentTime = resumeT;
@@ -909,7 +810,7 @@ export default function SwingTracer() {
         ctx.drawImage(cell.canvas, cx, cy);
         ctx.fillStyle = "#EDF2EA";
         ctx.font = "600 18px ui-monospace, Menlo, monospace";
-        ctx.fillText(`${cell.label}  ·  ${fmt(cell.t)}`, cx + 6, cy + ch + 24);
+        ctx.fillText(cell.label, cx + 6, cy + ch + 24);
       });
 
       const a = document.createElement("a");
@@ -926,30 +827,39 @@ export default function SwingTracer() {
     }
   };
 
-  const copyChatPrompt = () => {
-    const marked = POSITIONS.filter((p) => markers[p.id] != null);
-    const lines = [
-      `I'm attaching a frame sheet from one of my golf swings, filmed ${
-        view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
-      }. Frames read left to right, top to bottom, in swing order.`,
-      marked.length
-        ? `Each frame is labeled with its swing position: ${marked
-            .map((p) => `${p.label} (${fmt(markers[p.id])})`)
-            .join(", ")}.`
-        : "Frames are evenly sampled through the clip.",
-      `The clip is ${fps}fps, ${fmt(duration)} long.`,
-      "",
-      "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
-      "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
-      "Finish with 2-3 specific drills for the top-priority fault, and tell me exactly what to look for in my next video to confirm progress.",
-    ];
-    const flaggedNames = allFlagged.map((f) => f.name);
-    if (flaggedNames.length)
-      lines.push("", `Context: I've already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
-    if (notes.trim()) lines.push("", `My session notes: ${notes.trim()}`);
-    navigator.clipboard?.writeText(lines.join("\n"));
-    setExportState("copied");
-    setTimeout(() => setExportState("idle"), 2500);
+  const copyChatPrompt = async () => {
+    const v = videoRef.current;
+    if (!v || !duration) return;
+    v.pause();
+    const resumeT = v.currentTime;
+    setExportState("working");
+    try {
+      const frames = await getExportFrames(v);
+      v.currentTime = resumeT;
+      const lines = [
+        `I'm attaching a frame sheet from one of my golf swings, filmed ${
+          view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
+        }. Frames read left to right, top to bottom, in swing order.`,
+        `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
+        `The clip is ${fps}fps, ${fmt(duration)} long.`,
+        "",
+        "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
+        "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
+        "Finish with 2-3 specific drills for the top-priority fault, and tell me exactly what to look for in my next video to confirm progress.",
+      ];
+      const flaggedNames = allFlagged.map((f) => f.name);
+      if (flaggedNames.length)
+        lines.push("", `Context: I've already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
+      if (notes.trim()) lines.push("", `My session notes: ${notes.trim()}`);
+      navigator.clipboard?.writeText(lines.join("\n"));
+      setExportState("copied");
+      setTimeout(() => setExportState("idle"), 2500);
+    } catch (err) {
+      setExportState("idle");
+      setAiState("error");
+      setAiError("Building the chat prompt failed: " + String(err?.message || err));
+      if (videoRef.current) videoRef.current.currentTime = resumeT;
+    }
   };
 
   const runAnalysis = async () => {
@@ -966,17 +876,7 @@ export default function SwingTracer() {
     setAiError("");
     setAiResult(null);
     try {
-      const marked = POSITIONS.filter((p) => markers[p.id] != null).map((p) => ({
-        label: p.label,
-        t: markers[p.id],
-      }));
-      const frames =
-        marked.length >= 3
-          ? marked
-          : [0.02, 0.2, 0.4, 0.55, 0.7, 0.92].map((f, i) => ({
-              label: `Frame ${i + 1} of 6, at ${(f * 100).toFixed(0)}% of the clip`,
-              t: f * duration,
-            }));
+      const frames = await getExportFrames(v);
 
       const shots = [];
       for (const fr of frames) {
@@ -999,7 +899,7 @@ export default function SwingTracer() {
       content.push({
         type: "text",
         text:
-          `You are an expert golf instructor. These frames are from one swing filmed ${viewName}, in chronological order with labels. ` +
+          `You are an expert golf instructor. These frames are from one swing filmed ${viewName}, in chronological order with approximate labels — go by what's actually visible in each frame rather than trusting the label precisely. ` +
           `Analyze the swing. Be specific and reference what is visible (shaft direction, spine angle, hip depth, head position, weight, arm structure). ` +
           `Fault catalog for this camera angle: ${faultCatalog}. ` +
           `Respond with ONLY valid JSON, no markdown, no preamble, exactly this shape: ` +
@@ -1086,8 +986,6 @@ export default function SwingTracer() {
         .chip { border:1px solid var(--edge); background:var(--panel); color:var(--muted); border-radius:999px; padding:6px 11px; font-size:12px; font-weight:600; cursor:pointer; }
         .chip.set { color:var(--chalk); border-color:var(--green); }
         .chip.set .t { color:var(--green); }
-        .chip.sug { color:var(--chalk); border-color:var(--amber); }
-        .chip.sug .t { color:var(--amber); }
         .dot { width:22px; height:22px; border-radius:50%; border:2px solid transparent; cursor:pointer; }
         .dot.on { border-color:var(--chalk); }
         .tabs { display:flex; gap:2px; margin-top:18px; border-bottom:1px solid var(--edge); }
@@ -1215,7 +1113,7 @@ export default function SwingTracer() {
                 max={duration || 0}
                 step={0.001}
                 value={scrubT ?? time}
-                disabled={detectState === "working"}
+                disabled={busy}
                 onPointerDown={() => {
                   const v = videoRef.current;
                   wasPlayingRef.current = !!(v && !v.paused);
@@ -1230,7 +1128,7 @@ export default function SwingTracer() {
                 onPointerUp={() => {
                   setScrubT(null);
                   const v = videoRef.current;
-                  if (wasPlayingRef.current && v && detectState !== "working") {
+                  if (wasPlayingRef.current && v && !busy) {
                     v.playbackRate = speed;
                     v.play();
                   }
@@ -1240,11 +1138,11 @@ export default function SwingTracer() {
               />
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div className="row">
-                  <button className="btn" onClick={() => step(-1)} disabled={detectState === "working"}>⏮ Frame</button>
-                  <button className="btn primary" onClick={togglePlay} disabled={detectState === "working"}>
-                    {detectState === "working" ? "Detecting…" : playing ? "Pause" : "Play"}
+                  <button className="btn" onClick={() => step(-1)} disabled={busy}>⏮ Frame</button>
+                  <button className="btn primary" onClick={togglePlay} disabled={busy}>
+                    {playing ? "Pause" : "Play"}
                   </button>
-                  <button className="btn" onClick={() => step(1)} disabled={detectState === "working"}>Frame ⏭</button>
+                  <button className="btn" onClick={() => step(1)} disabled={busy}>Frame ⏭</button>
                 </div>
                 <span className="mono" style={{ fontSize: 13, color: "var(--amber)" }}>
                   {fmt(time)} / {fmt(duration)}
@@ -1264,94 +1162,36 @@ export default function SwingTracer() {
                   className={`btn small ${loop ? "on" : ""}`}
                   onClick={() => setLoop(!loop)}
                   disabled={markers.p1 == null || markers.p10 == null}
-                  title="Set P1 and P10 markers to loop the swing"
+                  title="Mark swing start and end to loop the swing"
                 >
-                  ↻ Loop P1–P10
+                  ↻ Loop swing
                 </button>
               </div>
             </div>
 
-            {/* position markers */}
+            {/* swing bounds */}
             <div className="row" style={{ marginTop: 12, justifyContent: "space-between" }}>
-              <span className="st-eyebrow" style={{ color: "var(--green)" }}>Positions</span>
+              <span className="st-eyebrow" style={{ color: "var(--green)" }}>Swing bounds</span>
               <div className="row">
-                <button
-                  className="btn small"
-                  onClick={autoDetect}
-                  disabled={detectState === "working"}
-                >
-                  {detectState === "working" ? "Detecting…" : "⚡ Auto-detect"}
-                </button>
                 <button className={`btn small ${markMode ? "on" : ""}`} onClick={() => setMarkMode(!markMode)}>
-                  {markMode ? "Marking: tap a chip to stamp this frame" : "✎ Mark positions"}
+                  {markMode ? "Marking: tap a pill to stamp this frame" : "✎ Mark start/end"}
                 </button>
               </div>
             </div>
+            <p className="hint" style={{ marginTop: 4 }}>
+              Mark where your swing starts and ends — everything exported in between is sampled automatically.
+            </p>
             <div className="chips">
               {POSITIONS.map((p) => (
                 <button
                   key={p.id}
-                  className={`chip ${markers[p.id] != null ? (suggested[p.id] ? "sug" : "set") : ""}`}
+                  className={`chip ${markers[p.id] != null ? "set" : ""}`}
                   onClick={() => tapMarker(p.id)}
                 >
                   {p.label}{markers[p.id] != null && <span className="t mono"> {fmt(markers[p.id])}</span>}
                 </button>
               ))}
             </div>
-            {detectMsg && detectState !== "working" && (
-              <div className="card" style={{ borderColor: detectState === "warn" ? "var(--amber)" : "var(--edge)" }}>
-                <p style={{ margin: 0, color: detectState === "warn" ? "var(--amber)" : "var(--muted)" }}>{detectMsg}</p>
-                {detectTrace && (
-                  <div style={{ marginTop: 10 }}>
-                    <svg
-                      viewBox="0 0 300 84"
-                      preserveAspectRatio="none"
-                      style={{ width: "100%", height: 84, display: "block", background: "var(--panel2)", borderRadius: 8 }}
-                    >
-                      {/* threshold lines */}
-                      <line x1="0" x2="300" y1={80 - (detectTrace.quiet / detectTrace.peakVal) * 72} y2={80 - (detectTrace.quiet / detectTrace.peakVal) * 72} stroke="#4A5850" strokeDasharray="3,3" strokeWidth="1" />
-                      <line x1="0" x2="300" y1={80 - (detectTrace.settle / detectTrace.peakVal) * 72} y2={80 - (detectTrace.settle / detectTrace.peakVal) * 72} stroke="#4A5850" strokeDasharray="1,3" strokeWidth="1" />
-                      {/* motion curve */}
-                      <polyline
-                        fill="none"
-                        stroke="#8FA096"
-                        strokeWidth="1.5"
-                        points={detectTrace.sm
-                          .map((v, i) => `${(detectTrace.times[i] / (duration || 1)) * 300},${80 - (v / detectTrace.peakVal) * 72}`)
-                          .join(" ")}
-                      />
-                      {/* placements */}
-                      {Object.entries(detectTrace.found).map(([id, t]) => {
-                        const colors = { p1: "#55C97B", p2: "#8FA096", p4: "#4DA3FF", p6: "#8FA096", p7: "#FF5A36", p10: "#FFB020" };
-                        const x = (t / (duration || 1)) * 300;
-                        return (
-                          <g key={id}>
-                            <line x1={x} x2={x} y1="10" y2="80" stroke={colors[id]} strokeWidth="1.5" />
-                            <text x={x + 2} y="9" fill={colors[id]} fontSize="8" fontFamily="monospace">{id.toUpperCase()}</text>
-                          </g>
-                        );
-                      })}
-                    </svg>
-                    <p className="hint mono" style={{ marginTop: 6, fontSize: 11 }}>
-                      {detectTrace.stats}
-                    </p>
-                    <p className="hint" style={{ marginTop: 2 }}>
-                      Motion trace — what detection saw. Dashed lines: quiet + settle thresholds. If a position looks wrong, screenshot this.
-                    </p>
-                  </div>
-                )}
-                {Object.values(suggested).some(Boolean) && (
-                  <div className="row" style={{ marginTop: 8, justifyContent: "flex-end" }}>
-                    <button
-                      className="btn small"
-                      onClick={() => { setSuggested({}); setDetectMsg(""); setDetectState("idle"); }}
-                    >
-                      ✓ Looks good — confirm all
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
           </>
         )}
 
@@ -1448,9 +1288,9 @@ export default function SwingTracer() {
                     : "Analyze this swing"}
                 </button>
                 <span className="hint">
-                  {POSITIONS.filter((p) => markers[p.id] != null).length >= 3
-                    ? `Using your ${POSITIONS.filter((p) => markers[p.id] != null).length} marked positions`
-                    : "No positions marked — will sample 6 frames evenly"}
+                  {markers.p1 != null && markers.p10 != null
+                    ? "Using your marked swing start/end"
+                    : "P1/P10 not marked — will sample across the whole clip"}
                 </span>
               </div>
             </div>
@@ -1470,8 +1310,8 @@ export default function SwingTracer() {
                 >
                   {exportState === "working" ? "Building sheet…" : "1 · Download frame sheet"}
                 </button>
-                <button className="btn" onClick={copyChatPrompt} disabled={!duration}>
-                  {exportState === "copied" ? "Copied ✓" : "2 · Copy chat prompt"}
+                <button className="btn" onClick={copyChatPrompt} disabled={!duration || exportState === "working"}>
+                  {exportState === "working" ? "Building prompt…" : exportState === "copied" ? "Copied ✓" : "2 · Copy chat prompt"}
                 </button>
               </div>
             </div>
