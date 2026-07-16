@@ -357,10 +357,6 @@ export default function SwingTracer() {
     setShapes([]);
     setAnglePts([]);
     setMarkers({});
-    setSuggested({});
-    setDetectState("idle");
-    setDetectMsg("");
-    setDetectTrace(null);
     setPlaying(false);
     setTime(0);
   };
@@ -609,7 +605,6 @@ export default function SwingTracer() {
       const v = videoRef.current;
       if (v && !v.paused) v.pause(); // stamp the frame you're looking at, not one later
       setMarkers((m) => ({ ...m, [id]: v?.currentTime ?? 0 }));
-      setSuggested((s) => ({ ...s, [id]: false }));
     } else if (markers[id] != null) {
       seek(markers[id]);
     }
