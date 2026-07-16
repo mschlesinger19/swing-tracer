@@ -861,8 +861,19 @@ export default function SwingTracer() {
     for (const t of scanTimes) scanData.push(await sampleLuma(t, lo.w, lo.h, lo.ctx));
     const scanDiffs = [0];
     for (let i = 1; i < N; i++) scanDiffs.push(diffOf(scanData[i], scanData[i - 1]));
-    let peakI = 1;
-    for (let i = 2; i < N; i++) if (scanDiffs[i] > scanDiffs[peakI]) peakI = i;
+    // Impact physically can't be in the front half of a marked P1→P10 swing
+    // (the backswing consumes most of the clock), yet takeaway motion can
+    // outscore the downswing at 96px — observed on a real clip: the global
+    // peak landed on the takeaway, 1.1s before impact, and dragged the
+    // dense window, the post-impact cap and the takeaway budget with it.
+    // Only the back 55% of the marked window is searched.
+    const peakFloor = start + 0.45 * span;
+    let peakI = -1;
+    for (let i = 1; i < N; i++) {
+      if (scanTimes[i] < peakFloor) continue;
+      if (peakI === -1 || scanDiffs[i] > scanDiffs[peakI]) peakI = i;
+    }
+    if (peakI === -1) peakI = N - 1; // degenerate: window too small to split
     const peakT = scanTimes[peakI];
     const scanSorted = [...scanDiffs].sort((a, b) => a - b);
     const scanMedian = scanSorted[Math.floor(scanSorted.length / 2)] || 0.001;
