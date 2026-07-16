@@ -1296,9 +1296,23 @@ export default function SwingTracer() {
 
     // A8: one flat, parseable compliance line — printed to the console AND
     // rendered in the sheet footer so a grader can diff instead of eyeball.
+    // Dominance gates the marker, not just the stats (agent's rule): only a
+    // DECISIVE strike (the strong tier — ≥20× ambient AND ≥5× the next
+    // transient, the same gate that anchors coverage at impact−0.35) earns
+    // the confident "★ impact". A confirmed-but-reverberant strike (high
+    // ratio, low dominance — an indoor/enclosure clip whose peak lags
+    // contact) demotes to "★ est. impact": the frame is present and densely
+    // bracketed, but the marker may sit a frame or two late. Ball-departure
+    // agreement (no audio) counts as precise since it required ±0.08s
+    // agreement with the motion peak.
+    const impactPrecise = impactStrong || (impactTrusted && !impactAudio);
+    const conf = impactStrong ? "CONFIRMED" : impactTrusted ? "APPROX" : "UNCONFIRMED";
+    const reverbNote =
+      impactAudio && impactTrusted && !impactStrong
+        ? `low dominance (${impactAudio.dominance.toFixed(1)}×) — indoor reverb suspected, marker may lag contact`
+        : null;
     const impactStat = impactAudio
-      ? `impact ${impactT.toFixed(2)}s audio ${impactAudio.ratio.toFixed(0)}×/${impactAudio.dominance.toFixed(1)}× ` +
-        (impactTrusted ? "CONFIRMED" : "UNCONFIRMED")
+      ? `impact ${impactT.toFixed(2)}s audio ${impactAudio.ratio.toFixed(0)}×/${impactAudio.dominance.toFixed(1)}× ${conf}`
       : `impact ${impactT.toFixed(2)}s ${impactTrusted ? "ball-departure CONFIRMED" : "motion-peak UNCONFIRMED"}`;
     const statsLine =
       `max_gap ${maxAny.toFixed(2)}s | core_gap ${Math.max(0, maxCore).toFixed(2)}s | ` +
@@ -1312,18 +1326,18 @@ export default function SwingTracer() {
         index: i + 1,
         fps,
         isImpactHint,
-        impactConfirmed: isImpactHint ? impactTrusted : false,
+        impactPrecise: isImpactHint ? impactPrecise : false,
         impactConfidence: isImpactHint ? impactMethod : null,
         label:
           `Frame ${i + 1} of ${times.length} — ${fmt(t)} (${fps}fps)` +
           (isImpactHint
-            ? impactTrusted
+            ? impactPrecise
               ? ` [impact — ${impactMethod}]`
               : ` [estimated impact — ${impactMethod}; treat as a hint, not truth]`
             : ""),
       };
     });
-    out.stats = { line: statsLine, confirmed: impactTrusted, pass };
+    out.stats = { line: statsLine, precise: impactPrecise, pass, reverbNote };
     return out;
   };
 
@@ -1367,16 +1381,18 @@ export default function SwingTracer() {
     const footerLines = [];
     // A8: the flat, parseable compliance line first (grader diffs this)
     if (frames.stats?.line) footerLines.push(...wrap(frames.stats.line));
-    // then the human-readable impact-method sentence, confirmed vs hint
+    // then the human-readable impact-method sentence, precise vs estimated
     if (impactCell) {
       footerLines.push(
         ...wrap(
-          impactCell.impactConfirmed
+          impactCell.impactPrecise
             ? `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — impact confirmed: ${impactCell.impactConfidence}.`
             : `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — estimated impact: ${impactCell.impactConfidence}. Treat as a hint, not truth.`
         )
       );
     }
+    // reverb caveat so the grader knows which way a low-dominance marker skews
+    if (frames.stats?.reverbNote) footerLines.push(...wrap(`⚠ ${frames.stats.reverbNote}`));
     const footerH = footerLines.length ? footerLines.length * footerLineH + pad * 2 : 0;
 
     const sheet = document.createElement("canvas");
@@ -1408,7 +1424,7 @@ export default function SwingTracer() {
       ctx.font = "600 18px ui-monospace, Menlo, monospace";
       ctx.fillText(
         `Frame ${cell.index} of ${cells.length} — ${fmt(cell.t)} (${cell.fps}fps)` +
-          (cell.isImpactHint ? (cell.impactConfirmed ? " ★ impact" : " ★ est. impact") : ""),
+          (cell.isImpactHint ? (cell.impactPrecise ? " ★ impact" : " ★ est. impact") : ""),
         cx + 6,
         cy + ch + 24
       );
