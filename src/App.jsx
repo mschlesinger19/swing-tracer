@@ -305,7 +305,8 @@ export default function SwingTracer() {
   const [markers, setMarkers] = useState({});
   const [markMode, setMarkMode] = useState(false);
   const [loop, setLoop] = useState(false);
-  const [tab, setTab] = useState("check");
+  const [tab, setTab] = useState("ai");
+  const [showIntro, setShowIntro] = useState(true);
   const [flags, setFlags] = useState({});
   const [notes, setNotes] = useState("");
   const [openFault, setOpenFault] = useState(null);
@@ -780,6 +781,56 @@ export default function SwingTracer() {
     return times.map((t, i) => ({ label: `Frame ${i + 1} of ${times.length} — ${fmt(t)}`, t }));
   };
 
+  // Composite the exported frames into one labeled JPEG sheet. Shared by the
+  // download button and the one-tap share action below.
+  const buildFrameSheetCanvas = async (frames) => {
+    const cells = [];
+    for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t, 640) });
+
+    const cols = cells.length <= 4 ? 2 : 3;
+    const rows = Math.ceil(cells.length / cols);
+    const cw = cells[0].canvas.width;
+    const ch = cells[0].canvas.height;
+    const labelH = 34;
+    const pad = 6;
+    const sheet = document.createElement("canvas");
+    sheet.width = cols * cw + (cols + 1) * pad;
+    sheet.height = rows * (ch + labelH + pad) + pad;
+    const ctx = sheet.getContext("2d");
+    ctx.fillStyle = "#0C120E";
+    ctx.fillRect(0, 0, sheet.width, sheet.height);
+    cells.forEach((cell, i) => {
+      const cx = pad + (i % cols) * (cw + pad);
+      const cy = pad + Math.floor(i / cols) * (ch + labelH + pad);
+      ctx.drawImage(cell.canvas, cx, cy);
+      ctx.fillStyle = "#EDF2EA";
+      ctx.font = "600 18px ui-monospace, Menlo, monospace";
+      ctx.fillText(cell.label, cx + 6, cy + ch + 24);
+    });
+    return sheet;
+  };
+
+  // Build the chat-analysis prompt text. Shared by the copy button and the
+  // one-tap share action below.
+  const buildChatPromptText = (frames) => {
+    const lines = [
+      `I'm attaching a frame sheet from one of my golf swings, filmed ${
+        view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
+      }. Frames read left to right, top to bottom, in swing order.`,
+      `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
+      `The clip is ${fps}fps, ${fmt(duration)} long.`,
+      "",
+      "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
+      "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
+      "Finish with 2-3 specific drills for the top-priority fault, and tell me exactly what to look for in my next video to confirm progress.",
+    ];
+    const flaggedNames = allFlagged.map((f) => f.name);
+    if (flaggedNames.length)
+      lines.push("", `Context: I've already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
+    if (notes.trim()) lines.push("", `My session notes: ${notes.trim()}`);
+    return lines.join("\n");
+  };
+
   const exportFrameSheet = async () => {
     const v = videoRef.current;
     if (!v || !duration) return;
@@ -788,30 +839,8 @@ export default function SwingTracer() {
     setExportState("working");
     try {
       const frames = await getExportFrames(v);
-      const cells = [];
-      for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t, 640) });
+      const sheet = await buildFrameSheetCanvas(frames);
       v.currentTime = resumeT;
-
-      const cols = cells.length <= 4 ? 2 : 3;
-      const rows = Math.ceil(cells.length / cols);
-      const cw = cells[0].canvas.width;
-      const ch = cells[0].canvas.height;
-      const labelH = 34;
-      const pad = 6;
-      const sheet = document.createElement("canvas");
-      sheet.width = cols * cw + (cols + 1) * pad;
-      sheet.height = rows * (ch + labelH + pad) + pad;
-      const ctx = sheet.getContext("2d");
-      ctx.fillStyle = "#0C120E";
-      ctx.fillRect(0, 0, sheet.width, sheet.height);
-      cells.forEach((cell, i) => {
-        const cx = pad + (i % cols) * (cw + pad);
-        const cy = pad + Math.floor(i / cols) * (ch + labelH + pad);
-        ctx.drawImage(cell.canvas, cx, cy);
-        ctx.fillStyle = "#EDF2EA";
-        ctx.font = "600 18px ui-monospace, Menlo, monospace";
-        ctx.fillText(cell.label, cx + 6, cy + ch + 24);
-      });
 
       const a = document.createElement("a");
       a.href = sheet.toDataURL("image/jpeg", 0.85);
@@ -836,28 +865,63 @@ export default function SwingTracer() {
     try {
       const frames = await getExportFrames(v);
       v.currentTime = resumeT;
-      const lines = [
-        `I'm attaching a frame sheet from one of my golf swings, filmed ${
-          view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
-        }. Frames read left to right, top to bottom, in swing order.`,
-        `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
-        `The clip is ${fps}fps, ${fmt(duration)} long.`,
-        "",
-        "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
-        "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
-        "Finish with 2-3 specific drills for the top-priority fault, and tell me exactly what to look for in my next video to confirm progress.",
-      ];
-      const flaggedNames = allFlagged.map((f) => f.name);
-      if (flaggedNames.length)
-        lines.push("", `Context: I've already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
-      if (notes.trim()) lines.push("", `My session notes: ${notes.trim()}`);
-      navigator.clipboard?.writeText(lines.join("\n"));
+      navigator.clipboard?.writeText(buildChatPromptText(frames));
       setExportState("copied");
       setTimeout(() => setExportState("idle"), 2500);
     } catch (err) {
       setExportState("idle");
       setAiState("error");
       setAiError("Building the chat prompt failed: " + String(err?.message || err));
+      if (videoRef.current) videoRef.current.currentTime = resumeT;
+    }
+  };
+
+  // One-tap path: build the same frame sheet + prompt, then hand them to the
+  // OS share sheet (navigator.share) so the user can pick "Claude" directly
+  // if it's installed and registered as a share target — no known way to
+  // deep-link/pre-fill claude.ai itself, so this is the closest "one click
+  // into Claude" that's actually achievable with standard web APIs. Falls
+  // back to the existing download+copy flow where file sharing isn't
+  // supported (e.g. most desktop browsers).
+  const shareSwing = async () => {
+    const v = videoRef.current;
+    if (!v || !duration) return;
+    v.pause();
+    const resumeT = v.currentTime;
+    setExportState("working");
+    try {
+      const frames = await getExportFrames(v);
+      const sheet = await buildFrameSheetCanvas(frames);
+      const text = buildChatPromptText(frames);
+      v.currentTime = resumeT;
+
+      const blob = await new Promise((resolve) => sheet.toBlob(resolve, "image/jpeg", 0.85));
+      const file = new File([blob], `swing-${view}-frames.jpg`, { type: "image/jpeg" });
+
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], text, title: "Swing analysis" });
+        setExportState("done");
+      } else {
+        // no native file sharing here — fall back to the two-step flow, but
+        // still do it in one tap: download the image, copy the prompt
+        const a = document.createElement("a");
+        a.href = sheet.toDataURL("image/jpeg", 0.85);
+        a.download = `swing-${view}-frames.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        navigator.clipboard?.writeText(text);
+        setAiError("This browser can't share files directly — downloaded the frame sheet and copied the prompt instead. Open Claude and attach + paste manually.");
+        setExportState("copied");
+        setTimeout(() => setExportState("idle"), 4000);
+      }
+    } catch (err) {
+      setExportState("idle");
+      if (String(err?.name) !== "AbortError") {
+        // AbortError = user just closed the share sheet, not a real failure
+        setAiState("error");
+        setAiError("Share failed: " + String(err?.message || err));
+      }
       if (videoRef.current) videoRef.current.currentTime = resumeT;
     }
   };
@@ -1011,6 +1075,21 @@ export default function SwingTracer() {
         <div className="st-sub">
           Load a swing, scrub it frame by frame, draw plane lines and angles, then flag faults to build a drill plan.
         </div>
+
+        {showIntro && (
+          <div className="card" style={{ marginTop: 12 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
+              <h4 style={{ margin: 0 }}>How to use Swing Tracer</h4>
+              <button className="btn small" onClick={() => setShowIntro(false)}>✕</button>
+            </div>
+            <ol style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+              <li>Load your swing video (down the line or face on).</li>
+              <li>In <b>✎ Mark start/end</b>, tap the swing-start and swing-end pills at the right frames.</li>
+              <li>Optional: draw plane lines, angles, or circles to check yourself against the checkpoints below.</li>
+              <li>Head to <b>AI coach</b> to get Claude's read, or download a frame sheet to analyze in a chat.</li>
+            </ol>
+          </div>
+        )}
 
         {/* view + upload */}
         <div className="row" style={{ marginTop: 12, justifyContent: "space-between" }}>
@@ -1197,25 +1276,26 @@ export default function SwingTracer() {
 
         {/* tabs */}
         <div className="tabs">
-          <button className={tab === "check" ? "on" : ""} onClick={() => setTab("check")}>Checkpoints</button>
-          <button className={tab === "faults" ? "on" : ""} onClick={() => setTab("faults")}>Faults & drills</button>
           <button className={tab === "ai" ? "on" : ""} onClick={() => setTab("ai")}>AI coach</button>
+          <button className={tab === "mechanics" ? "on" : ""} onClick={() => setTab("mechanics")}>Golf Swing Mechanics</button>
           <button className={tab === "plan" ? "on" : ""} onClick={() => setTab("plan")}>
             Session plan{allFlagged.length ? ` (${allFlagged.length})` : ""}
           </button>
+          <button className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>Settings</button>
         </div>
 
-        {tab === "check" &&
-          CHECKPOINTS[view].map((c) => (
-            <div className="card" key={c.pos}>
-              <h4>{c.pos}</h4>
-              <p>{c.what}</p>
-            </div>
-          ))}
-
-        {tab === "faults" && (
+        {tab === "mechanics" && (
           <>
-            <p className="hint" style={{ marginTop: 10 }}>
+            <h4 style={{ marginTop: 10 }}>Checkpoints</h4>
+            {CHECKPOINTS[view].map((c) => (
+              <div className="card" key={c.pos}>
+                <h4>{c.pos}</h4>
+                <p>{c.what}</p>
+              </div>
+            ))}
+
+            <h4 style={{ marginTop: 16 }}>Faults & drills</h4>
+            <p className="hint" style={{ marginTop: 6 }}>
               Showing {view === "dtl" ? "down-the-line" : "face-on"} faults. Tap a card to see what to look for; tap the box to flag it for your session plan.
             </p>
             {FAULTS[view].map((f) => {
@@ -1256,30 +1336,24 @@ export default function SwingTracer() {
               <h4>Claude swing analysis</h4>
               <p>
                 Captures key frames from your clip and sends them to Claude for a coaching read.
-                For the best analysis, mark at least P1, P4, P6 and P7 first — Claude then sees labeled
-                checkpoint frames instead of evenly-spaced guesses. Detected faults are auto-flagged
-                into your session plan with their drills.
+                Mark your swing start and end first for the best sampling — Claude then sees frames
+                spanning the actual swing instead of guesses across the whole clip. Detected faults
+                are auto-flagged into your session plan with their drills.
               </p>
-              <div className="row" style={{ marginTop: 10 }}>
-                <input
-                  type="password"
-                  placeholder="Anthropic API key (sk-ant-…)"
-                  value={apiKey}
-                  onChange={(e) => saveApiKey(e.target.value)}
-                  style={{
-                    flex: 1, minWidth: 200, background: "var(--panel2)", color: "var(--chalk)",
-                    border: "1px solid var(--edge)", borderRadius: 8, padding: "8px 10px", fontSize: 13,
-                  }}
-                />
-              </div>
-              <p className="hint" style={{ marginTop: 6 }}>
-                Stored only in this browser's local storage. Get a key at console.anthropic.com — each analysis costs a few cents.
-              </p>
+              {!apiKey && (
+                <p className="hint" style={{ marginTop: 6, color: "var(--amber)" }}>
+                  No API key set — add one in the{" "}
+                  <span style={{ textDecoration: "underline", cursor: "pointer" }} onClick={() => setTab("settings")}>
+                    Settings
+                  </span>{" "}
+                  tab first.
+                </p>
+              )}
               <div className="row" style={{ marginTop: 10 }}>
                 <button
                   className="btn primary"
                   onClick={runAnalysis}
-                  disabled={!src || !duration || aiState === "capturing" || aiState === "analyzing"}
+                  disabled={!src || !duration || !apiKey || aiState === "capturing" || aiState === "analyzing"}
                 >
                   {aiState === "capturing"
                     ? "Capturing frames…"
@@ -1290,7 +1364,7 @@ export default function SwingTracer() {
                 <span className="hint">
                   {markers.p1 != null && markers.p10 != null
                     ? "Using your marked swing start/end"
-                    : "P1/P10 not marked — will sample across the whole clip"}
+                    : "Swing start/end not marked — will sample across the whole clip"}
                 </span>
               </div>
             </div>
@@ -1298,10 +1372,27 @@ export default function SwingTracer() {
             <div className="card">
               <h4>No API key? Analyze in a chat</h4>
               <p>
-                Download a labeled frame sheet of your marked positions, then in a Claude chat:
-                attach the image and paste the copied prompt. Same analysis, no key needed —
-                the prompt includes your camera angle, position labels, flagged faults, and notes.
+                Download a frame sheet spanning your swing, then in a Claude chat: attach the image
+                and paste the copied prompt. Same analysis, no key needed — the prompt includes
+                your camera angle, flagged faults, and notes.
               </p>
+              {typeof navigator !== "undefined" && navigator.share && (
+                <>
+                  <div className="row" style={{ marginTop: 10 }}>
+                    <button
+                      className="btn primary"
+                      onClick={shareSwing}
+                      disabled={!src || !duration || exportState === "working"}
+                    >
+                      {exportState === "working" ? "Preparing…" : "📤 Share to Claude"}
+                    </button>
+                  </div>
+                  <p className="hint" style={{ marginTop: 6 }}>
+                    Opens your device's share sheet with the frame sheet + prompt — pick Claude if it's installed.
+                  </p>
+                  <p className="hint" style={{ marginTop: 10 }}>Or do it manually:</p>
+                </>
+              )}
               <div className="row" style={{ marginTop: 10 }}>
                 <button
                   className="btn"
@@ -1403,6 +1494,31 @@ export default function SwingTracer() {
               </p>
             </div>
           </>
+        )}
+
+        {tab === "settings" && (
+          <div className="card" style={{ marginTop: 10 }}>
+            <h4>Anthropic API key</h4>
+            <p>
+              Only needed for the direct "Analyze this swing" button on the AI coach tab — the
+              chat-export path (download frame sheet + copy prompt) works without one.
+            </p>
+            <div className="row" style={{ marginTop: 10 }}>
+              <input
+                type="password"
+                placeholder="Anthropic API key (sk-ant-…)"
+                value={apiKey}
+                onChange={(e) => saveApiKey(e.target.value)}
+                style={{
+                  flex: 1, minWidth: 200, background: "var(--panel2)", color: "var(--chalk)",
+                  border: "1px solid var(--edge)", borderRadius: 8, padding: "8px 10px", fontSize: 13,
+                }}
+              />
+            </div>
+            <p className="hint" style={{ marginTop: 6 }}>
+              Stored only in this browser's local storage. Get a key at console.anthropic.com — each analysis costs a few cents.
+            </p>
+          </div>
         )}
       </div>
     </div>
