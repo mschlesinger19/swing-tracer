@@ -946,7 +946,9 @@ export default function SwingTracer() {
     const peakSharp = scanDiffs[peakI] / scanMedian;
 
     let impactT = peakT;
-    let impactTrusted = false; // earned by a decisive audio click, or ball-departure agreeing with the peak
+    let impactTrusted = false; // post-impact cap enforced + core coverage ends at impact
+    let impactStrong = false;  // audio decisive enough to ALSO start core coverage at impact−0.35 (A2)
+    let impactAudio = null;    // the accepted click, for the stats line
     let impactMethod = `motion peak only (no impact click, no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
 
     // ---- pass 2: audio impact click (rule 2) — the primary refiner ----
@@ -954,6 +956,12 @@ export default function SwingTracer() {
     if (click && click.ratio >= 12 && click.dominance >= 2 && click.t >= peakT - 0.9 && click.t <= peakT + 0.4) {
       impactT = snap(click.t);
       impactTrusted = true;
+      // strong tier (agent's A2 gate): ≥20× ambient AND ≥5× the next
+      // transient. Only this tier moves the core-coverage start to
+      // impact−0.35 (freeing redundant top frames); the weaker confirmed
+      // tier still enforces the post-cap and ends core coverage at impact.
+      impactStrong = click.ratio >= 20 && click.dominance >= 5;
+      impactAudio = click;
       impactMethod = `audio impact click, ${click.ratio.toFixed(0)}× ambient, ${click.dominance.toFixed(1)}× next transient`;
     } else if (click) {
       console.info(
@@ -965,9 +973,12 @@ export default function SwingTracer() {
     // ---- pass 2b (fallback, rule 2b): find the ball — static through the
     // early window (golfer moves, ball doesn't), permanently changed by the
     // end (ball gone). Block-level scoring; restricted to the lower 60% of
-    // the frame since the ball sits at ground/tee height. Skipped entirely
-    // when the audio click confirmed (saves ~50 seeks).
-    if (!impactTrusted) {
+    // the frame since the ball sits at ground/tee height. Skipped when the
+    // audio click confirmed (saves ~50 seeks) AND disabled for face-on:
+    // there the struck ball flies toward/away from the camera, so the
+    // static-early/changed-late ROI latches onto body motion and produces a
+    // worse hint than the honest motion-peak fallback (agent's face-on rule).
+    if (!impactTrusted && view !== "fo") {
       const BLOCK = 16;
       const avgBlockDiff = (a, b, bx, by) => {
         let sum = 0, n = 0;
@@ -1065,10 +1076,34 @@ export default function SwingTracer() {
     // no impact frame at all.
     let times = [...new Set([...sparse, ...denseTimes, snap(impactT), snap(end)].map(snap))].sort((a, b) => a - b);
 
-    // ---- rule 4: at most 3 frames after estimated impact — release, mid
-    // follow-through, finish hold. (Estimate-independent coverage rules run
-    // AFTER this and may re-insert if the 40-85% region demands it.)
-    {
+    // ---- rule 4 (A3): exactly three post-impact frames at deterministic
+    // offsets — impact+0.10 (release: shaft/path/extension), impact+0.35
+    // (mid follow-through: rotation/posture), swing_end (finish/balance).
+    // The +0.35 frame yields to A1: if either post gap would exceed the 25%
+    // ceiling, the middle frame is rebalanced to the midpoint of release→end
+    // (this is exactly what the approved golfer-2 baseline does — its +0.35
+    // lands at 1.78 but the sheet uses 1.97 to keep the finish gap legal).
+    // All post-impact frames are protected from the dedupe and count passes
+    // so the count stays exactly 3.
+    // Only impose the exact-3 canonical set when impact is TRUSTED. On an
+    // unconfirmed estimate the offsets would hang off a possibly-wrong
+    // anchor, and the coverage safety net below (which still spans 40-85%
+    // of the window when untrusted) is the right behavior instead — so fall
+    // back to the loose "keep first/mid/last of whatever's there" cap.
+    const postProtected = new Set();
+    if (impactTrusted) {
+      const p0 = snap(impactT + 0.1);
+      const pEnd = snap(end);
+      let p1 = snap(impactT + 0.35);
+      if (p1 - p0 > 0.25 * span || pEnd - p1 > 0.25 * span) p1 = snap((p0 + pEnd) / 2);
+      const canon = [...new Set([p0, p1, pEnd])]
+        .filter((t) => t > impactT + frameDur / 2 && t <= end + 1e-9)
+        .sort((a, b) => a - b);
+      times = times.filter((t) => t <= impactT + frameDur / 2);
+      times.push(...canon);
+      times = [...new Set(times.map(snap))].sort((a, b) => a - b);
+      for (const t of canon) postProtected.add(t);
+    } else {
       const post = times.filter((t) => t > impactT + frameDur / 2);
       if (post.length > 3) {
         const keep = new Set([post[0], post[Math.floor(post.length / 2)], post[post.length - 1]]);
@@ -1077,22 +1112,28 @@ export default function SwingTracer() {
     }
 
     // ---- hard coverage rules (enforced last so they hold even if the
-    // estimates above are wrong). The 0.10s core region normally spans
-    // 40-85% of the window; when impact is ball-confirmed it ends at
-    // impact instead, otherwise it re-inserts the follow-through frames
-    // rule 4 just removed (that's exactly how the 7-post-impact-frame
-    // sheet happened). The global 25% ceiling stays unconditional.
-    const regionA = start + 0.4 * span;
+    // estimates above are wrong). The 0.10s core region's trailing edge ends
+    // at impact when impact is trusted (else 85% of the window). Its leading
+    // edge (A2) starts at impact−0.35 only when audio is DECISIVE (strong
+    // tier) — that frees the redundant top-of-backswing frames; otherwise it
+    // holds at 40% of the window so an uncertain estimate can't open a hole
+    // over the real delivery. The global 25% ceiling stays unconditional.
+    // Post-impact pairs are exempt here: rule 4 (A3) owns that region and
+    // already keeps both post gaps under the 25% ceiling by construction.
     const regionB = start + 0.85 * span;
+    const coreA = impactStrong ? Math.max(start, snap(impactT - 0.35)) : start + 0.4 * span;
     const coreB = impactTrusted ? Math.min(regionB, impactT + frameDur) : regionB;
     const violation = (a, b) => {
       if (b - a > 0.25 * span) return true; // global ceiling
-      const inRegion = Math.min(b, coreB) - Math.max(a, regionA);
+      const inRegion = Math.min(b, coreB) - Math.max(a, coreA);
       return inRegion > 0.1; // core-of-swing ceiling
     };
     for (let guard = 0; guard < 80; guard++) {
       let worstI = -1, worstGap = -1;
       for (let i = 0; i < times.length - 1; i++) {
+        // A3 owns the post-impact side only when impact is trusted; when
+        // untrusted the 40-85% safety net must still cover it
+        if (impactTrusted && times[i] >= impactT - frameDur / 2) continue;
         if (violation(times[i], times[i + 1]) && times[i + 1] - times[i] > worstGap) {
           worstGap = times[i + 1] - times[i];
           worstI = i;
@@ -1131,6 +1172,7 @@ export default function SwingTracer() {
         if (
           !isLast &&
           !isImpact &&
+          !postProtected.has(t) && // A3 fixes the post-impact frames
           changedFracOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
           nextT - prev <= Math.min(0.2, 0.25 * span)
         ) {
@@ -1194,6 +1236,7 @@ export default function SwingTracer() {
       let bestI = -1, bestGap = Infinity;
       for (let i = 1; i < times.length - 1; i++) {
         if (Math.abs(times[i] - impactT) < frameDur / 2) continue; // never drop the impact frame
+        if (postProtected.has(times[i])) continue; // A3 fixes the post-impact frames
         if (violation(times[i - 1], times[i + 1])) continue; // removal would break coverage
         const gap = times[i + 1] - times[i - 1];
         if (gap < bestGap) { bestGap = gap; bestI = i; }
@@ -1208,40 +1251,49 @@ export default function SwingTracer() {
     // Core gaps inside verified-static spans are exempt (rule 7): the
     // pixels proved nothing happened there. Post-impact cap is asserted
     // only when impact is ball-confirmed (rule 5 note).
-    {
-      let maxAny = 0, maxCore = 0;
-      for (let i = 0; i < times.length - 1; i++) {
-        maxAny = Math.max(maxAny, times[i + 1] - times[i]);
-        if (inStaticSpan(times[i], times[i + 1])) continue;
-        maxCore = Math.max(maxCore, Math.min(times[i + 1], coreB) - Math.max(times[i], regionA));
-      }
-      const postN = times.filter((t) => t > impactT + frameDur / 2).length;
-      const postOk = !impactTrusted || postN <= 3;
-      const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
-      console.info(
-        `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} ` +
-          `(frame ${impactPresent ? "present" : "MISSING"}) · ` +
-          `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
-          `max core gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10, core ends at ${impactTrusted ? "impact" : "85%"}) · ` +
-          `post-impact ${postN}/${impactTrusted ? "3" : "3 (unenforced — low-trust impact)"} · ` +
-          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${(100 * DEDUPE_THRESH).toFixed(1)}% px) · ` +
-          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk && impactPresent ? "PASS" : "FAIL"}`
-      );
+    let maxAny = 0, maxCore = 0;
+    for (let i = 0; i < times.length - 1; i++) {
+      maxAny = Math.max(maxAny, times[i + 1] - times[i]);
+      if (inStaticSpan(times[i], times[i + 1])) continue;
+      maxCore = Math.max(maxCore, Math.min(times[i + 1], coreB) - Math.max(times[i], coreA));
     }
+    const postN = times.filter((t) => t > impactT + frameDur / 2).length;
+    const postOk = !impactTrusted || postN === 3;
+    const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
+    const pass =
+      maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk && impactPresent;
 
-    return times.map((t, i) => {
+    // A8: one flat, parseable compliance line — printed to the console AND
+    // rendered in the sheet footer so a grader can diff instead of eyeball.
+    const impactStat = impactAudio
+      ? `impact ${impactT.toFixed(2)}s audio ${impactAudio.ratio.toFixed(0)}×/${impactAudio.dominance.toFixed(1)}× ` +
+        (impactTrusted ? "CONFIRMED" : "UNCONFIRMED")
+      : `impact ${impactT.toFixed(2)}s ${impactTrusted ? "ball-departure CONFIRMED" : "motion-peak UNCONFIRMED"}`;
+    const statsLine =
+      `max_gap ${maxAny.toFixed(2)}s | core_gap ${Math.max(0, maxCore).toFixed(2)}s | ` +
+      `post_impact ${postN}/3 | ${impactStat} | frames ${times.length} | ${pass ? "PASS" : "FAIL"}`;
+    console.info(`[frames] ${statsLine} · impact frame ${impactPresent ? "present" : "MISSING"} · deduped ${dedupedN}`);
+
+    const out = times.map((t, i) => {
       const isImpactHint = Math.abs(t - impactT) < frameDur / 2;
       return {
         t,
         index: i + 1,
         fps,
         isImpactHint,
+        impactConfirmed: isImpactHint ? impactTrusted : false,
         impactConfidence: isImpactHint ? impactMethod : null,
         label:
           `Frame ${i + 1} of ${times.length} — ${fmt(t)} (${fps}fps)` +
-          (isImpactHint ? ` [estimated impact — ${impactMethod}; treat as a hint, not truth]` : ""),
+          (isImpactHint
+            ? impactTrusted
+              ? ` [impact — ${impactMethod}]`
+              : ` [estimated impact — ${impactMethod}; treat as a hint, not truth]`
+            : ""),
       };
     });
+    out.stats = { line: statsLine, confirmed: impactTrusted, pass };
+    return out;
   };
 
   // Composite the exported frames into one labeled JPEG sheet. Shared by the
@@ -1265,23 +1317,34 @@ export default function SwingTracer() {
     const impactCell = cells.find((c) => c.isImpactHint);
     const footerFont = "500 14px ui-monospace, Menlo, monospace";
     const footerLineH = 19;
-    const footerLines = [];
-    if (impactCell) {
-      const meas = document.createElement("canvas").getContext("2d");
-      meas.font = footerFont;
-      const text =
-        `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — estimated impact: ` +
-        `${impactCell.impactConfidence}. Treat as a hint, not truth.`;
-      const maxW = cols * cw + (cols - 1) * pad - 4;
+    const maxW = cols * cw + (cols - 1) * pad - 4;
+    const meas = document.createElement("canvas").getContext("2d");
+    meas.font = footerFont;
+    const wrap = (text) => {
+      const out = [];
       let line = "";
       for (const word of text.split(" ")) {
         const probe = line ? `${line} ${word}` : word;
         if (line && meas.measureText(probe).width > maxW) {
-          footerLines.push(line);
+          out.push(line);
           line = word;
         } else line = probe;
       }
-      if (line) footerLines.push(line);
+      if (line) out.push(line);
+      return out;
+    };
+    const footerLines = [];
+    // A8: the flat, parseable compliance line first (grader diffs this)
+    if (frames.stats?.line) footerLines.push(...wrap(frames.stats.line));
+    // then the human-readable impact-method sentence, confirmed vs hint
+    if (impactCell) {
+      footerLines.push(
+        ...wrap(
+          impactCell.impactConfirmed
+            ? `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — impact confirmed: ${impactCell.impactConfidence}.`
+            : `★ Frame ${impactCell.index} (${fmt(impactCell.t)}) — estimated impact: ${impactCell.impactConfidence}. Treat as a hint, not truth.`
+        )
+      );
     }
     const footerH = footerLines.length ? footerLines.length * footerLineH + pad * 2 : 0;
 
@@ -1314,7 +1377,7 @@ export default function SwingTracer() {
       ctx.font = "600 18px ui-monospace, Menlo, monospace";
       ctx.fillText(
         `Frame ${cell.index} of ${cells.length} — ${fmt(cell.t)} (${cell.fps}fps)` +
-          (cell.isImpactHint ? " ★ est. impact" : ""),
+          (cell.isImpactHint ? (cell.impactConfirmed ? " ★ impact" : " ★ est. impact") : ""),
         cx + 6,
         cy + ch + 24
       );
