@@ -829,26 +829,26 @@ export default function SwingTracer() {
       let peakI = -1;
       for (let i = i0; i <= i1; i++) if (peakI === -1 || rms[i] > rms[peakI]) peakI = i;
       if (peakI === -1) return null;
-      // onset: walk back from the peak to the LEADING EDGE of the sound —
-      // where energy first rises above ambient (4× the clip median), capped
-      // at 0.7s of walk-back. NOT a fraction of the peak: on a clean outdoor
-      // "crack" the peak already is the onset (they sit <1 frame apart), but
-      // an indoor/reverberant or slow-mo-stretched strike peaks LATE — the
-      // ball hitting a net plus room reverb keep building for ~0.5s after
-      // contact — so a peak-relative walk-back lands half a second past the
-      // real strike. Measured on a face-on slow-mo net clip: peak at 10.27s
-      // but the sound (and the video club-ball contact) begins at 9.72s.
+      // onset: walk back from the peak only while energy stays ≥25% of the
+      // peak. Do NOT chase the ambient floor: the pre-impact downswing
+      // swoosh clears ambient ~0.3-0.5s before contact, so an
+      // ambient-relative leading edge lands well before the strike (measured
+      // on a face-on slow-mo net clip: ground-truth club-ball contact at
+      // ~10.12s, but the swoosh ramp rises above 4× median by 9.72s — a
+      // 0.4s error). The 25%-of-peak floor stays on the loud crack itself;
+      // on a clean click the peak already is the onset (<1 frame apart), and
+      // on a reverberant/stretched strike it holds near the peak (~0.15s
+      // after contact) rather than running early down the swoosh.
       let onI = peakI;
-      while (onI > i0 && onI > peakI - 70 && rms[onI - 1] > 4 * med) onI--;
-      // If the leading edge sits far below the peak the strike is at the
-      // edge (reverberant/stretched); within ~0.12s it's a clean click and
-      // the peak is the crisper single-frame pick — which keeps clean-click
-      // clips landing on the exact frame they did before this refinement.
-      const impactI = (peakI - onI) * 0.01 > 0.12 ? onI : peakI;
-      // dominance: the next-strongest transient ≥0.3s away
+      while (onI > i0 && rms[onI - 1] >= 0.25 * rms[peakI]) onI--;
+      // dominance: the next-strongest transient ≥0.3s away. Reverberant or
+      // slow-mo-stretched strikes score low here (a sustained blob keeps the
+      // tail loud); clean clicks score very high. The caller gates trust on
+      // it — and the dense window reaching impact−0.35s means even a
+      // reverb-late anchor still captures the true-impact frame.
       let second = 0;
       for (let i = i0; i <= i1; i++) if (Math.abs(i - peakI) > 30) second = Math.max(second, rms[i]);
-      return { t: impactI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
+      return { t: onI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
     } catch {
       return null;
     }
@@ -1068,6 +1068,13 @@ export default function SwingTracer() {
     const denseTimes = Array.from({ length: denseN }, (_, i) =>
       snap(denseStart + (i / (denseN - 1)) * (denseEnd - denseStart))
     );
+    // The dense window is the delivery money zone — it must stay finely
+    // sampled (0.075s) regardless of the scaled core-gap. Without this, on a
+    // slow-mo clip the loosened core-gap lets the count ceiling thin these
+    // out and the frame nearest the true strike disappears (observed: a
+    // face-on slo-mo sheet dropped the club-at-ball frame, leaving a 0.2s
+    // hole across impact). Protect the pre-impact dense frames from thinning.
+    const denseProtected = new Set(denseTimes.map(snap));
 
     // content-driven sparse coverage before the dense window, from the scan
     // we already have (no extra seeks)
@@ -1124,21 +1131,32 @@ export default function SwingTracer() {
     }
 
     // ---- hard coverage rules (enforced last so they hold even if the
-    // estimates above are wrong). The 0.10s core region's trailing edge ends
-    // at impact when impact is trusted (else 85% of the window). Its leading
+    // estimates above are wrong). The core region's trailing edge ends at
+    // impact when impact is trusted (else 85% of the window). Its leading
     // edge (A2) starts at impact−0.35 only when audio is DECISIVE (strong
     // tier) — that frees the redundant top-of-backswing frames; otherwise it
     // holds at 40% of the window so an uncertain estimate can't open a hole
     // over the real delivery. The global 25% ceiling stays unconditional.
     // Post-impact pairs are exempt here: rule 4 (A3) owns that region and
     // already keeps both post gaps under the 25% ceiling by construction.
+    //
+    // The core-gap limit SCALES with the window: it was a flat 0.10s tuned
+    // on ~2.2s normal-speed swings, but on a slow-motion clip the marked
+    // window is several times longer (the same swing stretched), so a flat
+    // 0.10s of video time covers almost no motion and forces ~20 frames
+    // across the delivery alone (a 6.5s face-on slo-mo window blew up to 26
+    // frames). Scaling by span/2.2 keeps the historical 0.10s on normal
+    // clips (the floor pins it there) and loosens proportionally on slo-mo,
+    // so the frame COUNT — not the absolute spacing — stays roughly constant
+    // across capture speeds.
     const regionB = start + 0.85 * span;
     const coreA = impactStrong ? Math.max(start, snap(impactT - 0.35)) : start + 0.4 * span;
     const coreB = impactTrusted ? Math.min(regionB, impactT + frameDur) : regionB;
+    const coreGap = Math.max(0.1, 0.05 * span);
     const violation = (a, b) => {
       if (b - a > 0.25 * span) return true; // global ceiling
       const inRegion = Math.min(b, coreB) - Math.max(a, coreA);
-      return inRegion > 0.1; // core-of-swing ceiling
+      return inRegion > coreGap; // core-of-swing ceiling
     };
     for (let guard = 0; guard < 80; guard++) {
       let worstI = -1, worstGap = -1;
@@ -1249,6 +1267,7 @@ export default function SwingTracer() {
       for (let i = 1; i < times.length - 1; i++) {
         if (Math.abs(times[i] - impactT) < frameDur / 2) continue; // never drop the impact frame
         if (postProtected.has(times[i])) continue; // A3 fixes the post-impact frames
+        if (denseProtected.has(times[i])) continue; // keep the delivery money zone dense
         if (violation(times[i - 1], times[i + 1])) continue; // removal would break coverage
         const gap = times[i + 1] - times[i - 1];
         if (gap < bestGap) { bestGap = gap; bestI = i; }
@@ -1273,7 +1292,7 @@ export default function SwingTracer() {
     const postOk = !impactTrusted || postN === 3;
     const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
     const pass =
-      maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk && impactPresent;
+      maxAny <= 0.25 * span + 1e-6 && maxCore <= coreGap + 1e-6 && times.length >= 12 && postOk && impactPresent;
 
     // A8: one flat, parseable compliance line — printed to the console AND
     // rendered in the sheet footer so a grader can diff instead of eyeball.
