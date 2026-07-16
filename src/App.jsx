@@ -296,6 +296,7 @@ export default function SwingTracer() {
   const [duration, setDuration] = useState(0);
   const [speed, setSpeed] = useState(0.5);
   const [fps, setFps] = useState(60);
+  const [fpsSource, setFpsSource] = useState("default"); // default | detected | manual
   const [view, setView] = useState("dtl");
   const [tool, setTool] = useState("off");
   const [color, setColor] = useState(DRAW_COLORS[0]);
@@ -314,6 +315,8 @@ export default function SwingTracer() {
   const [scrubT, setScrubT] = useState(null); // non-null while finger owns the scrubber
   const wasPlayingRef = useRef(false);
   const primedRef = useRef(false); // first frame painted yet?
+  const fpsDetectRef = useRef(false); // fps detection attempted for this clip?
+  const fpsManualRef = useRef(false); // user overrode fps for this clip?
   const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error
   const [loadMsg, setLoadMsg] = useState("");
   const fileRef = useRef(null);
@@ -351,6 +354,9 @@ export default function SwingTracer() {
     fileRef.current = f;
     triedDataUrl.current = false;
     primedRef.current = false;
+    fpsDetectRef.current = false;
+    fpsManualRef.current = false;
+    setFpsSource("default");
     setLoadState("loading");
     setLoadMsg(`Loading ${f.name} (${(f.size / 1048576).toFixed(1)} MB)…`);
     setSrc(URL.createObjectURL(f));
@@ -441,10 +447,67 @@ export default function SwingTracer() {
         requestAnimationFrame(() => {
           v.pause();
           try { v.currentTime = 0; } catch {}
+          detectClipFps();
         });
       }).catch(() => {
         try { v.currentTime = 0.01; } catch {} // fallback: the old nudge
       });
+    }
+  };
+
+  // Measure the clip's real frame rate instead of making the golfer know it
+  // — the wrong value silently corrupts the export's frame-snapping grid
+  // (a 60fps grid on a 30fps clip "selects" duplicate source frames; that
+  // shipped on real sheets because 60 was just the untouched default).
+  // requestVideoFrameCallback reports the SOURCE timestamp of each painted
+  // frame, so consecutive mediaTime deltas are exact frame durations.
+  // Playback runs muted at 0.25× so high-fps slo-mo clips present more of
+  // their frames within the display's refresh budget; the low-quartile
+  // delta rides over dropped-frame doubles. The fps select stays as an
+  // override and always wins once touched.
+  const detectClipFps = async () => {
+    const v = videoRef.current;
+    if (!v || fpsDetectRef.current || !("requestVideoFrameCallback" in v)) return;
+    fpsDetectRef.current = true;
+    const t0 = v.currentTime;
+    const rate0 = v.playbackRate;
+    const muted0 = v.muted;
+    const deltas = [];
+    let handle = null;
+    try {
+      v.muted = true;
+      v.playbackRate = 0.25;
+      const collected = new Promise((resolve) => {
+        let last = null;
+        const stop = setTimeout(resolve, 2000);
+        const onFrame = (_now, meta) => {
+          if (last != null && meta.mediaTime > last + 0.0005) deltas.push(meta.mediaTime - last);
+          last = meta.mediaTime;
+          if (deltas.length >= 20) { clearTimeout(stop); resolve(); }
+          else handle = v.requestVideoFrameCallback(onFrame);
+        };
+        handle = v.requestVideoFrameCallback(onFrame);
+      });
+      await v.play();
+      await collected;
+    } catch {
+      /* autoplay blocked or decode hiccup — the manual selector still works */
+    } finally {
+      if (handle != null && "cancelVideoFrameCallback" in v) v.cancelVideoFrameCallback(handle);
+      v.pause();
+      v.playbackRate = rate0;
+      v.muted = muted0;
+      try { v.currentTime = t0; } catch {}
+    }
+    if (deltas.length < 6) return; // not enough evidence — keep the default
+    deltas.sort((a, b) => a - b);
+    const raw = 1 / deltas[Math.floor(deltas.length * 0.25)];
+    const common = [24, 25, 30, 50, 60, 100, 120, 240];
+    const detected = common.find((c) => Math.abs(raw - c) / c < 0.1) ?? Math.round(raw);
+    console.info(`[fps] detected ${detected} (raw ${raw.toFixed(2)} from ${deltas.length} deltas)`);
+    if (!fpsManualRef.current) {
+      setFps(detected);
+      setFpsSource("detected");
     }
   };
 
@@ -1423,7 +1486,7 @@ export default function SwingTracer() {
             </div>
             <p className="hint" style={{ maxWidth: 420, margin: "8px auto 0" }}>
               Film from down the line (camera at hand height, on the target line) or face on (camera at chest height, square to you).
-              Slow-mo clips from your phone work great — the frame stepper assumes the FPS you pick below.
+              Slow-mo or normal clips from your phone both work great — the frame rate is detected automatically when the clip loads.
             </p>
             <p className="hint mono" style={{ marginTop: 10, color: hevcOk ? "var(--green)" : "var(--amber)" }}>
               {hevcOk
@@ -1545,9 +1608,19 @@ export default function SwingTracer() {
                 <select value={speed} onChange={(e) => setSpeed(parseFloat(e.target.value))}>
                   {SPEEDS.map((s) => <option key={s} value={s}>{s}×</option>)}
                 </select>
-                <label className="hint">Clip FPS</label>
-                <select value={fps} onChange={(e) => setFps(parseInt(e.target.value))}>
-                  {FPS_OPTIONS.map((f) => <option key={f} value={f}>{f}</option>)}
+                <label className="hint">
+                  Clip FPS{fpsSource === "detected" ? " · auto" : fpsSource === "manual" ? " · manual" : ""}
+                </label>
+                <select
+                  value={fps}
+                  onChange={(e) => {
+                    fpsManualRef.current = true;
+                    setFpsSource("manual");
+                    setFps(parseInt(e.target.value));
+                  }}
+                  title={fpsSource === "detected" ? "Detected from the clip — change only if it looks wrong" : undefined}
+                >
+                  {[...new Set([fps, ...FPS_OPTIONS])].sort((a, b) => a - b).map((f) => <option key={f} value={f}>{f}</option>)}
                 </select>
                 <span style={{ flex: 1 }} />
                 <button
