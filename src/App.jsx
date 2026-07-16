@@ -357,10 +357,6 @@ export default function SwingTracer() {
     setShapes([]);
     setAnglePts([]);
     setMarkers({});
-    setSuggested({});
-    setDetectState("idle");
-    setDetectMsg("");
-    setDetectTrace(null);
     setPlaying(false);
     setTime(0);
   };
@@ -609,7 +605,6 @@ export default function SwingTracer() {
       const v = videoRef.current;
       if (v && !v.paused) v.pause(); // stamp the frame you're looking at, not one later
       setMarkers((m) => ({ ...m, [id]: v?.currentTime ?? 0 }));
-      setSuggested((s) => ({ ...s, [id]: false }));
     } else if (markers[id] != null) {
       seek(markers[id]);
     }
@@ -732,8 +727,24 @@ export default function SwingTracer() {
   //  5. estimate-independent hard rules enforced LAST, so they hold even
   //     when every estimate above is wrong: no gap >0.10s inside the
   //     40–85% region of the marked window, no gap >25% of the window
-  //     anywhere, ≥12 frames; results of these checks logged per sheet
+  //     anywhere, ≥12 frames; results of these checks logged per sheet.
+  //     When impact is BALL-CONFIRMED the 0.10s core region ends at impact
+  //     instead of 85% — the unconditional version re-inserted the exact
+  //     follow-through frames rule 4 had removed whenever impact fell
+  //     inside the 40-85% band (observed: 7 post-impact frames on a sheet
+  //     whose impact sat at 68% of the window). Low-trust estimates keep
+  //     the full 40-85% safety net, so the post-impact cap is best-effort
+  //     only in that case.
   //  6. every timestamp snapped to a real source frame at the declared fps
+  //  7. visually-static dedupe: a selected frame nearly pixel-identical to
+  //     the previously kept one is dropped (the club hovers at the top, so
+  //     time-uniform dense sampling bought 5 duplicate top-of-backswing
+  //     frames). Identical pixels are proof no action was missed, so these
+  //     gaps are exempt from the 0.10s core rule — but never the impact
+  //     frame or an endpoint, and the global 25% ceiling still applies
+  //  8. budget freed by 4+7 is spent on the takeaway (start → dense
+  //     window), splitting gaps >0.30s — previously ~0.5s takeaway gaps
+  //     left no shaft-parallel-back frame
   const getExportFrames = async (v, maxCount = 18) => {
     // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
     // fall back to the whole clip rather than guessing at where the swing is
@@ -815,6 +826,7 @@ export default function SwingTracer() {
     // ---- pass 3: ball-departure search. Window skews EARLY of the motion
     // peak because peak errors skew late (follow-through dominates motion).
     let impactT = peakT;
+    let impactTrusted = false; // true only when ball-departure confirms the estimate
     let impactMethod = `motion peak only (no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
     if (ball) {
       const sStart = Math.max(start, peakT - 0.5);
@@ -838,6 +850,7 @@ export default function SwingTracer() {
       if (found != null && run >= 3) {
         const delta = peakT - found;
         impactT = found;
+        impactTrusted = true;
         impactMethod =
           `ball-departure at static ROI; motion peak ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s ` +
           (Math.abs(delta) > 0.06 ? "rejected" : "agreed");
@@ -878,13 +891,18 @@ export default function SwingTracer() {
       }
     }
 
-    // ---- hard, estimate-independent coverage rules (enforced last so they
-    // hold even if every estimate above was wrong) ----
+    // ---- hard coverage rules (enforced last so they hold even if the
+    // estimates above are wrong). The 0.10s core region normally spans
+    // 40-85% of the window; when impact is ball-confirmed it ends at
+    // impact instead, otherwise it re-inserts the follow-through frames
+    // rule 4 just removed (that's exactly how the 7-post-impact-frame
+    // sheet happened). The global 25% ceiling stays unconditional.
     const regionA = start + 0.4 * span;
     const regionB = start + 0.85 * span;
+    const coreB = impactTrusted ? Math.min(regionB, impactT + frameDur) : regionB;
     const violation = (a, b) => {
       if (b - a > 0.25 * span) return true; // global ceiling
-      const inRegion = Math.min(b, regionB) - Math.max(a, regionA);
+      const inRegion = Math.min(b, coreB) - Math.max(a, regionA);
       return inRegion > 0.1; // core-of-swing ceiling
     };
     for (let guard = 0; guard < 80; guard++) {
@@ -901,6 +919,75 @@ export default function SwingTracer() {
       times.splice(worstI + 1, 0, mid);
     }
 
+    // ---- rule 7: dedupe visually-static frames. The club hovers at the
+    // top of the backswing, so time-uniform dense sampling buys duplicate
+    // images there. A frame nearly pixel-identical to the previously KEPT
+    // frame carries no information — drop it and note the span as
+    // verified-static so the core-gap check (and its verification log)
+    // don't count it as a coverage hole. Never drops the impact frame or
+    // an endpoint, and a static span may grow to at most 0.20s — the top
+    // hover lasts ~0.3-0.4s and collapsing it entirely hides how long the
+    // club sat there; a bookend every ≤0.2s keeps ~2 frames at the top,
+    // which is the budget the analysis actually wants spent there.
+    const DEDUPE_THRESH = Math.max(1.5, 0.45 * scanMedian);
+    const lumaAt = new Map();
+    for (const t of times) lumaAt.set(t, await sampleLuma(t, lo.w, lo.h, lo.ctx));
+    const staticSpans = []; // [a, b] gaps whose dropped interior frames all matched a
+    let dedupedN = 0;
+    {
+      const kept = [times[0]];
+      let dropsSinceKeep = 0;
+      for (let i = 1; i < times.length; i++) {
+        const t = times[i];
+        const prev = kept[kept.length - 1];
+        const isLast = i === times.length - 1;
+        const isImpact = Math.abs(t - impactT) < frameDur / 2;
+        const nextT = isLast ? null : times[i + 1];
+        if (
+          !isLast &&
+          !isImpact &&
+          diffOf(lumaAt.get(t), lumaAt.get(prev)) < DEDUPE_THRESH &&
+          nextT - prev <= Math.min(0.2, 0.25 * span)
+        ) {
+          dedupedN++;
+          dropsSinceKeep++;
+          continue;
+        }
+        if (dropsSinceKeep > 0) staticSpans.push([prev, t]);
+        dropsSinceKeep = 0;
+        kept.push(t);
+      }
+      times = kept;
+    }
+    const inStaticSpan = (a, b) =>
+      staticSpans.some((s) => a >= s[0] - 1e-6 && b <= s[1] + 1e-6);
+
+    // ---- rule 8: spend the freed budget on the takeaway/early backswing
+    // (start → dense window), where coverage was thinnest (~0.5s gaps, no
+    // shaft-parallel-back frame). Split the largest takeaway gap while one
+    // exceeds 0.30s and the budget allows; skip a split whose new frame
+    // would just dedupe away again.
+    {
+      const MAX_TAKEAWAY_GAP = 0.3;
+      const noSplit = new Set();
+      while (times.length < maxCount) {
+        let bestI = -1, bestGap = MAX_TAKEAWAY_GAP;
+        for (let i = 0; i < times.length - 1; i++) {
+          if (times[i + 1] > denseStart + 1e-6) break;
+          if (noSplit.has(times[i])) continue;
+          const gap = times[i + 1] - times[i];
+          if (gap > bestGap) { bestGap = gap; bestI = i; }
+        }
+        if (bestI === -1) break;
+        const mid = snap((times[bestI] + times[bestI + 1]) / 2);
+        if (mid <= times[bestI] || mid >= times[bestI + 1]) { noSplit.add(times[bestI]); continue; }
+        const f = await sampleLuma(mid, lo.w, lo.h, lo.ctx);
+        if (diffOf(f, lumaAt.get(times[bestI])) < DEDUPE_THRESH) { noSplit.add(times[bestI]); continue; }
+        lumaAt.set(mid, f);
+        times.splice(bestI + 1, 0, mid);
+      }
+    }
+
     // ---- count floor/ceiling. Floor pads the downswing (pre-impact side of
     // the dense window). Ceiling thins only where no rule breaks; accepts
     // running slightly over maxCount rather than violating coverage.
@@ -908,6 +995,7 @@ export default function SwingTracer() {
       let bestI = -1, bestGap = -1;
       for (let i = 0; i < times.length - 1; i++) {
         if (times[i + 1] > impactT + frameDur / 2) continue;
+        if (inStaticSpan(times[i], times[i + 1])) continue; // don't re-add deduped frames
         const gap = times[i + 1] - times[i];
         if (gap > bestGap) { bestGap = gap; bestI = i; }
       }
@@ -931,18 +1019,26 @@ export default function SwingTracer() {
     times = [...new Set(times)].sort((a, b) => a - b);
 
     // mechanical verification of the hard rules on every sheet — this line
-    // is the acceptance test; if a bad sheet ever ships, this says why
+    // is the acceptance test; if a bad sheet ever ships, this says why.
+    // Core gaps inside verified-static spans are exempt (rule 7): the
+    // pixels proved nothing happened there. Post-impact cap is asserted
+    // only when impact is ball-confirmed (rule 5 note).
     {
       let maxAny = 0, maxCore = 0;
       for (let i = 0; i < times.length - 1; i++) {
         maxAny = Math.max(maxAny, times[i + 1] - times[i]);
-        maxCore = Math.max(maxCore, Math.min(times[i + 1], regionB) - Math.max(times[i], regionA));
+        if (inStaticSpan(times[i], times[i + 1])) continue;
+        maxCore = Math.max(maxCore, Math.min(times[i + 1], coreB) - Math.max(times[i], regionA));
       }
+      const postN = times.filter((t) => t > impactT + frameDur / 2).length;
+      const postOk = !impactTrusted || postN <= 3;
       console.info(
         `[frames] ${times.length} frames · impact ${impactMethod} @ ${fmt(impactT)} · ` +
           `max gap ${maxAny.toFixed(2)}s (limit ${(0.25 * span).toFixed(2)}) · ` +
-          `max 40-85% gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10) · ` +
-          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 ? "PASS" : "FAIL"}`
+          `max core gap ${Math.max(0, maxCore).toFixed(2)}s (limit 0.10, core ends at ${impactTrusted ? "impact" : "85%"}) · ` +
+          `post-impact ${postN}/${impactTrusted ? "3" : "3 (unenforced — low-trust impact)"} · ` +
+          `deduped ${dedupedN} static frame${dedupedN === 1 ? "" : "s"} (thresh ${DEDUPE_THRESH.toFixed(1)}) · ` +
+          `${maxAny <= 0.25 * span + 1e-6 && maxCore <= 0.1 + 1e-6 && times.length >= 12 && postOk ? "PASS" : "FAIL"}`
       );
     }
 
