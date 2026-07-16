@@ -635,27 +635,24 @@ export default function SwingTracer() {
 
   /* ---------- Claude analysis ---------- */
 
-  const captureFrame = async (t) => {
+  // Scale by the SHORT side, not a cap on the long side — a 768px cap on a
+  // 16:9 clip's long side leaves the short side at only ~430px, well under
+  // the 500px floor needed to resolve shaft direction and pelvis position.
+  // 720 gives comfortable margin above that floor without ballooning size.
+  const captureFrameCanvas = async (t, minShortSide = 720) => {
     const v = videoRef.current;
     await seekAndPaint(v, t);
-    const scale = Math.min(1, 768 / Math.max(v.videoWidth, v.videoHeight));
-    const c = document.createElement("canvas");
-    c.width = Math.round(v.videoWidth * scale);
-    c.height = Math.round(v.videoHeight * scale);
-    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-    return c.toDataURL("image/jpeg", 0.7).split(",")[1];
-  };
-
-  const captureCanvasAt = async (t, maxDim = 640) => {
-    const v = videoRef.current;
-    await seekAndPaint(v, t);
-    const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight));
+    const scale = minShortSide / Math.min(v.videoWidth, v.videoHeight);
     const c = document.createElement("canvas");
     c.width = Math.round(v.videoWidth * scale);
     c.height = Math.round(v.videoHeight * scale);
     c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
     return c;
   };
+
+  const captureFrame = async (t) => (await captureFrameCanvas(t)).toDataURL("image/jpeg", 0.7).split(",")[1];
+
+  const captureCanvasAt = (t) => captureFrameCanvas(t);
 
   /* ---------- auto position detection (motion energy) ---------- */
 
@@ -718,27 +715,29 @@ export default function SwingTracer() {
   };
 
   // Shared frame selection for the downloadable frame sheet, the chat-export
-  // prompt, and the AI Coach direct-analysis path. Precise P-position labels
-  // turned out not to matter for a vision-capable AI reading a swing — it
-  // can tell address from impact from finish on sight. What matters is
-  // marking the swing's actual start and end (tap P1 and P10 in Mark mode);
-  // everything between them is filled by keyframe-style dedup — walk the
-  // real pixel content and keep a frame only when it looks meaningfully
-  // different from the last one kept, so fast stretches (the downswing)
-  // naturally get more frames and static holds (address, the finish) get
-  // collapsed to one or two, capped at maxCount.
-  // No cap by default — the download/copy/share paths cost nothing extra
-  // per frame, so every genuinely distinct moment is kept. runAnalysis
-  // passes an explicit cap since it sends real images to the paid API,
-  // where more frames means more cost and latency per analysis.
-  const getExportFrames = async (v, maxCount = Infinity) => {
+  // prompt, and the AI Coach direct-analysis path — built around an explicit
+  // coverage spec (see project notes) rather than a single content-driven
+  // heuristic, since relying purely on "distinct from last kept" proved it
+  // can walk past exactly the moment that matters (motion blur at impact
+  // can make a fast transition look LESS different than a slower one
+  // elsewhere). The guarantees:
+  //  - no gap anywhere wider than 25% of the marked swing duration
+  //  - the final 35% of the window (impact lives here for any plausible
+  //    tempo) sampled at <=0.08s spacing regardless of content, so
+  //    coverage there never depends on correctly guessing where impact is
+  //  - a frame in the first/last 5% of the window (address/finish)
+  //  - 12-18 frames total
+  //  - every timestamp snapped to an actual source frame (given the
+  //    declared fps), not an arbitrary fractional second
+  const getExportFrames = async (v, maxCount = 18) => {
     // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
     // fall back to the whole clip rather than guessing at where the swing is
     const start = markers.p1 ?? 0;
     const end = markers.p10 ?? duration;
+    const span = Math.max(end - start, 0.01);
+    const frameDur = 1 / (fps || 30);
+    const snap = (t) => Math.min(end, Math.max(start, Math.round(t / frameDur) * frameDur));
 
-    const CANDIDATES = 90;
-    const candTimes = Array.from({ length: CANDIDATES }, (_, i) => start + (i / (CANDIDATES - 1)) * (end - start));
     const W = 96;
     const H = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * W) || 54);
     const c = document.createElement("canvas");
@@ -746,100 +745,159 @@ export default function SwingTracer() {
     c.height = H;
     const ctx = c.getContext("2d", { willReadFrequently: true });
 
-    const rawData = [];
-    const diffs = [0];
-    let prev = null;
-    for (const t of candTimes) {
-      const data = await sampleLuma(t, W, H, ctx);
-      rawData.push(data);
-      if (prev) diffs.push(diffOf(data, prev));
-      prev = data;
-    }
-    // threshold adapts to this clip's own noise floor rather than a fixed
-    // magic number, since contrast/lighting/distance vary a lot by footage
-    const sortedDiffs = [...diffs].sort((a, b) => a - b);
-    const median = sortedDiffs[Math.floor(sortedDiffs.length / 2)] || 0.001;
+    // ---- C2: dense, structural coverage of the final 35% of the window.
+    // Fixed spacing regardless of content — this is what guarantees impact
+    // is covered even if our own motion-diff guess at where it is turns
+    // out wrong, rather than betting everything on that guess being right.
+    const ZONE_FRAC = 0.35;
+    const DENSE_STEP = 0.075; // margin under the 0.08s hard limit
+    const zoneStart = start + (1 - ZONE_FRAC) * span;
+    const denseCount = Math.max(6, Math.ceil((end - zoneStart) / DENSE_STEP) + 1);
+    const denseTimes = Array.from({ length: denseCount }, (_, i) =>
+      snap(zoneStart + (i / (denseCount - 1)) * (end - zoneStart))
+    );
+    const denseData = [];
+    for (const t of denseTimes) denseData.push(await sampleLuma(t, W, H, ctx));
+    const denseDiffs = [0];
+    for (let i = 1; i < denseData.length; i++) denseDiffs.push(diffOf(denseData[i], denseData[i - 1]));
+    let peakDenseIdx = 1;
+    for (let i = 2; i < denseDiffs.length; i++) if (denseDiffs[i] > denseDiffs[peakDenseIdx]) peakDenseIdx = i;
+    const denseSorted = [...denseDiffs].sort((a, b) => a - b);
+    const denseMedian = denseSorted[Math.floor(denseSorted.length / 2)] || 0.001;
+    // rough, honest confidence note per the "treat as hint" requirement —
+    // not a real detector, just how sharply the peak stands out locally
+    const impactHintT = denseTimes[peakDenseIdx];
+    const impactConfidence =
+      denseDiffs[peakDenseIdx] / denseMedian > 3
+        ? "moderate (clear local motion spike)"
+        : "low (no sharp motion spike found — clip may be noisy or low-contrast)";
 
-    // greedy keep at a given threshold: compare each candidate to the last
-    // KEPT frame (not just the previous candidate), so slow, steady drift
-    // across many small steps still eventually triggers a keep once it
-    // accumulates enough real change
+    // ---- C1: content-driven sparse coverage before the dense zone, with a
+    // hard ceiling on gap size regardless of content (25% of total window)
+    const SPARSE_CANDIDATES = 60;
+    const sparseTimes = Array.from({ length: SPARSE_CANDIDATES }, (_, i) =>
+      start + (i / (SPARSE_CANDIDATES - 1)) * (zoneStart - start)
+    );
+    const sparseData = [];
+    for (const t of sparseTimes) sparseData.push(await sampleLuma(t, W, H, ctx));
+    const sparseDiffs = [0];
+    for (let i = 1; i < sparseData.length; i++) sparseDiffs.push(diffOf(sparseData[i], sparseData[i - 1]));
+    const sparseSorted = [...sparseDiffs].sort((a, b) => a - b);
+    const sparseMedian = sparseSorted[Math.floor(sparseSorted.length / 2)] || 0.001;
+
     const greedyKeep = (thresh) => {
       const idx = [0];
-      let lastKeptData = rawData[0];
-      for (let i = 1; i < candTimes.length; i++) {
-        if (diffOf(rawData[i], lastKeptData) > thresh) {
+      let lastKeptData = sparseData[0];
+      for (let i = 1; i < sparseTimes.length; i++) {
+        if (diffOf(sparseData[i], lastKeptData) > thresh) {
           idx.push(i);
-          lastKeptData = rawData[i];
+          lastKeptData = sparseData[i];
         }
       }
-      if (idx[idx.length - 1] !== candTimes.length - 1) idx.push(candTimes.length - 1);
       return idx;
     };
+    const keptIdx = greedyKeep(Math.max(sparseMedian * 1.5, 1e-6));
+    let sparseSel = keptIdx.map((i) => sparseTimes[i]);
+    if (!sparseSel.includes(start)) sparseSel.unshift(start);
 
-    // if too many frames pass, raise the bar and retry rather than blindly
-    // index-subsampling the result afterward — a fast stretch (impact) can
-    // produce a dense run of "distinct" frames, and evenly subsampling BY
-    // INDEX across an unevenly-dense list can thin out exactly that cluster
-    // disproportionately. Raising the threshold instead preferentially
-    // drops the least-distinct frames first, wherever they are.
-    let mult = 1.5;
-    let keptIdx = greedyKeep(Math.max(median * mult, 1e-6));
+    // hard max-gap ceiling — bridge with midpoints wherever content-driven
+    // selection alone leaves too wide a stretch, including the gap into
+    // the dense zone (zoneStart acts as a temporary sentinel for that)
+    const maxGap = 0.25 * span;
+    sparseSel.push(zoneStart);
+    let changed = true;
     let guard = 0;
-    while (keptIdx.length > maxCount && guard < 20) {
-      mult *= 1.25;
-      keptIdx = greedyKeep(Math.max(median * mult, 1e-6));
+    while (changed && guard < 50) {
+      changed = false;
+      for (let i = 0; i < sparseSel.length - 1; i++) {
+        if (sparseSel[i + 1] - sparseSel[i] > maxGap) {
+          sparseSel.splice(i + 1, 0, (sparseSel[i] + sparseSel[i + 1]) / 2);
+          changed = true;
+          break;
+        }
+      }
       guard++;
     }
+    sparseSel.pop(); // drop the zoneStart sentinel — denseTimes already starts there
 
-    // last-resort safety net if the loop above couldn't converge in time —
-    // should rarely trigger
-    let finalIdx = keptIdx;
-    if (finalIdx.length > maxCount) {
-      finalIdx = Array.from(
-        { length: maxCount },
-        (_, i) => keptIdx[Math.round((i * (keptIdx.length - 1)) / (maxCount - 1))]
-      );
+    // ---- merge, frame-snap, dedupe, sort ----
+    let allTimes = [...sparseSel, ...denseTimes].map(snap);
+    allTimes = [...new Set(allTimes)].sort((a, b) => a - b);
+    // small tolerance so frame-snapping the boundary sample slightly earlier
+    // than the nominal zoneStart can't misclassify it as "sparse" and make
+    // it eligible for thinning
+    const isDense = (t) => t >= zoneStart - frameDur / 2;
+
+    // ---- C5: 12-18 total. Dense zone (C2) is never touched by either
+    // direction — it's the one guarantee we don't trade away.
+    while (allTimes.length > maxCount) {
+      let bestI = -1, bestGap = Infinity;
+      for (let i = 0; i < allTimes.length - 1; i++) {
+        if (isDense(allTimes[i]) || isDense(allTimes[i + 1])) continue;
+        const gap = allTimes[i + 1] - allTimes[i];
+        if (gap < bestGap) { bestGap = gap; bestI = i; }
+      }
+      if (bestI === -1) break; // nothing left outside the dense zone to safely thin
+      allTimes.splice(bestI + 1, 1);
     }
+    while (allTimes.length < 12) {
+      let bestI = -1, bestGap = -1;
+      for (let i = 0; i < allTimes.length - 1; i++) {
+        if (isDense(allTimes[i + 1])) continue;
+        const gap = allTimes[i + 1] - allTimes[i];
+        if (gap > bestGap) { bestGap = gap; bestI = i; }
+      }
+      if (bestI === -1) break;
+      allTimes.splice(bestI + 1, 0, snap((allTimes[bestI] + allTimes[bestI + 1]) / 2));
+    }
+    allTimes = [...new Set(allTimes)].sort((a, b) => a - b);
 
-    // always guarantee the single sharpest consecutive-frame transition is
-    // captured explicitly. Motion blur at high club-head speed can actually
-    // SUPPRESS the greedy-keep comparison right around impact — a fast,
-    // blurred transition can look LESS different from a somewhat-distant
-    // "last kept" reference than a slower, sharper transition elsewhere, so
-    // relying purely on "distinct from last kept" can walk right past the
-    // exact moment that matters most. This can push the result one frame
-    // over maxCount in the rare case it wasn't already captured — worth it
-    // to never silently miss impact.
-    let peakDiffIdx = 1;
-    for (let i = 2; i < diffs.length; i++) if (diffs[i] > diffs[peakDiffIdx]) peakDiffIdx = i;
-    if (!finalIdx.includes(peakDiffIdx)) finalIdx = [...finalIdx, peakDiffIdx].sort((a, b) => a - b);
-
-    const times = finalIdx.map((i) => candTimes[i]);
-    return times.map((t, i) => ({ label: `Frame ${i + 1} of ${times.length} — ${fmt(t)}`, t }));
+    return allTimes.map((t, i) => {
+      const isImpactHint = Math.abs(t - impactHintT) < frameDur / 2;
+      return {
+        t,
+        index: i + 1,
+        fps,
+        isImpactHint,
+        impactConfidence: isImpactHint ? impactConfidence : null,
+        label:
+          `Frame ${i + 1} of ${allTimes.length} — ${fmt(t)} (${fps}fps)` +
+          (isImpactHint ? ` [estimated impact — motion peak, confidence: ${impactConfidence}; treat as a hint, not truth]` : ""),
+      };
+    });
   };
 
   // Composite the exported frames into one labeled JPEG sheet. Shared by the
   // download button and the one-tap share action below.
   const buildFrameSheetCanvas = async (frames) => {
     const cells = [];
-    for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t, 640) });
+    for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t) });
 
     const cols = cells.length <= 4 ? 2 : 3;
     const rows = Math.ceil(cells.length / cols);
     const cw = cells[0].canvas.width;
     const ch = cells[0].canvas.height;
     const labelH = 34;
+    const headerH = 30;
     const pad = 6;
     const sheet = document.createElement("canvas");
     sheet.width = cols * cw + (cols + 1) * pad;
-    sheet.height = rows * (ch + labelH + pad) + pad;
+    sheet.height = headerH + rows * (ch + labelH + pad) + pad;
     const ctx = sheet.getContext("2d");
     ctx.fillStyle = "#0C120E";
     ctx.fillRect(0, 0, sheet.width, sheet.height);
+    // sheet-level metadata as the user actually declared it (camera angle),
+    // not inferred — plus fps and frame count for reference while diagnosing
+    ctx.fillStyle = "#8FA096";
+    ctx.font = "600 16px ui-monospace, Menlo, monospace";
+    ctx.fillText(
+      `${view === "dtl" ? "Down the line" : "Face on"} · ${fps}fps · ${cells.length} frames`,
+      pad + 2,
+      20
+    );
     cells.forEach((cell, i) => {
       const cx = pad + (i % cols) * (cw + pad);
-      const cy = pad + Math.floor(i / cols) * (ch + labelH + pad);
+      const cy = headerH + pad + Math.floor(i / cols) * (ch + labelH + pad);
       ctx.drawImage(cell.canvas, cx, cy);
       ctx.fillStyle = "#EDF2EA";
       ctx.font = "600 18px ui-monospace, Menlo, monospace";
@@ -851,12 +909,16 @@ export default function SwingTracer() {
   // Build the chat-analysis prompt text. Shared by the copy button and the
   // one-tap share action below.
   const buildChatPromptText = (frames) => {
+    const impactFrame = frames.find((f) => f.isImpactHint);
     const lines = [
       `I'm attaching a frame sheet from one of my golf swings, filmed ${
         view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
       }. Frames read left to right, top to bottom, in swing order.`,
       `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
       `The clip is ${fps}fps, ${fmt(duration)} long.`,
+      ...(impactFrame
+        ? [`Motion-based impact estimate: ${fmt(impactFrame.t)} (confidence: ${impactFrame.impactConfidence}) — treat this as a hint, not ground truth.`]
+        : []),
       "",
       "Act as a golf instructor. For each labeled frame, give one specific observation (shaft direction, spine angle, hip depth, head position, weight, arm structure).",
       "Then identify the 1-2 highest-priority faults clearly visible — e.g. over the top, early extension, across the line at the top, sway, casting, chicken wing — citing which frame shows the evidence.",
@@ -978,7 +1040,7 @@ export default function SwingTracer() {
     setAiError("");
     setAiResult(null);
     try {
-      const frames = await getExportFrames(v, 18); // cap here only — real cost/latency per image on the paid API path
+      const frames = await getExportFrames(v); // default cap (18) applies here same as the other paths now
 
       const shots = [];
       for (const fr of frames) {
