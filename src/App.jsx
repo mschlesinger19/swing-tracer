@@ -321,7 +321,11 @@ export default function SwingTracer() {
   const [aiState, setAiState] = useState("idle"); // idle | capturing | analyzing | done | error
   const [aiResult, setAiResult] = useState(null);
   const [aiError, setAiError] = useState("");
-  const [exportState, setExportState] = useState("idle"); // idle | working | done | copied
+  // { action: null|"sheet"|"prompt"|"share", status: "idle"|"working"|"done"|"copied" } —
+  // action isolates which button's label should react; status alone (via
+  // exportBusy below) still gates the shared single-occupancy video access
+  const [exportState, setExportState] = useState({ action: null, status: "idle" });
+  const exportBusy = exportState.status === "working";
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
   });
@@ -399,7 +403,7 @@ export default function SwingTracer() {
   // true while a frame-capture pass (export or AI analysis) is seeking
   // through the video — playback/frame-stepping must stay off the video
   // element while that has exclusive control of it
-  const busy = exportState === "working" || aiState === "capturing" || aiState === "analyzing";
+  const busy = exportBusy || aiState === "capturing" || aiState === "analyzing";
 
   const togglePlay = () => {
     const v = videoRef.current;
@@ -723,7 +727,11 @@ export default function SwingTracer() {
   // different from the last one kept, so fast stretches (the downswing)
   // naturally get more frames and static holds (address, the finish) get
   // collapsed to one or two, capped at maxCount.
-  const getExportFrames = async (v, maxCount = 14) => {
+  // No cap by default — the download/copy/share paths cost nothing extra
+  // per frame, so every genuinely distinct moment is kept. runAnalysis
+  // passes an explicit cap since it sends real images to the paid API,
+  // where more frames means more cost and latency per analysis.
+  const getExportFrames = async (v, maxCount = Infinity) => {
     // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
     // fall back to the whole clip rather than guessing at where the swing is
     const start = markers.p1 ?? 0;
@@ -751,24 +759,41 @@ export default function SwingTracer() {
     // magic number, since contrast/lighting/distance vary a lot by footage
     const sortedDiffs = [...diffs].sort((a, b) => a - b);
     const median = sortedDiffs[Math.floor(sortedDiffs.length / 2)] || 0.001;
-    const distinctThresh = Math.max(median * 1.5, 1e-6);
 
-    // greedy keep: compare each candidate to the last KEPT frame (not just
-    // the previous candidate), so slow, steady drift across many small
-    // steps still eventually triggers a keep once it accumulates enough
-    // real change
-    const keptIdx = [0];
-    let lastKeptData = rawData[0];
-    for (let i = 1; i < candTimes.length; i++) {
-      if (diffOf(rawData[i], lastKeptData) > distinctThresh) {
-        keptIdx.push(i);
-        lastKeptData = rawData[i];
+    // greedy keep at a given threshold: compare each candidate to the last
+    // KEPT frame (not just the previous candidate), so slow, steady drift
+    // across many small steps still eventually triggers a keep once it
+    // accumulates enough real change
+    const greedyKeep = (thresh) => {
+      const idx = [0];
+      let lastKeptData = rawData[0];
+      for (let i = 1; i < candTimes.length; i++) {
+        if (diffOf(rawData[i], lastKeptData) > thresh) {
+          idx.push(i);
+          lastKeptData = rawData[i];
+        }
       }
-    }
-    if (keptIdx[keptIdx.length - 1] !== candTimes.length - 1) keptIdx.push(candTimes.length - 1);
+      if (idx[idx.length - 1] !== candTimes.length - 1) idx.push(candTimes.length - 1);
+      return idx;
+    };
 
-    // safety cap in case a noisy clip triggers far more "distinct" frames
-    // than is useful — keep an even subset rather than truncating the tail
+    // if too many frames pass, raise the bar and retry rather than blindly
+    // index-subsampling the result afterward — a fast stretch (impact) can
+    // produce a dense run of "distinct" frames, and evenly subsampling BY
+    // INDEX across an unevenly-dense list can thin out exactly that cluster
+    // disproportionately. Raising the threshold instead preferentially
+    // drops the least-distinct frames first, wherever they are.
+    let mult = 1.5;
+    let keptIdx = greedyKeep(Math.max(median * mult, 1e-6));
+    let guard = 0;
+    while (keptIdx.length > maxCount && guard < 20) {
+      mult *= 1.25;
+      keptIdx = greedyKeep(Math.max(median * mult, 1e-6));
+      guard++;
+    }
+
+    // last-resort safety net if the loop above couldn't converge in time —
+    // should rarely trigger
     let finalIdx = keptIdx;
     if (finalIdx.length > maxCount) {
       finalIdx = Array.from(
@@ -776,6 +801,19 @@ export default function SwingTracer() {
         (_, i) => keptIdx[Math.round((i * (keptIdx.length - 1)) / (maxCount - 1))]
       );
     }
+
+    // always guarantee the single sharpest consecutive-frame transition is
+    // captured explicitly. Motion blur at high club-head speed can actually
+    // SUPPRESS the greedy-keep comparison right around impact — a fast,
+    // blurred transition can look LESS different from a somewhat-distant
+    // "last kept" reference than a slower, sharper transition elsewhere, so
+    // relying purely on "distinct from last kept" can walk right past the
+    // exact moment that matters most. This can push the result one frame
+    // over maxCount in the rare case it wasn't already captured — worth it
+    // to never silently miss impact.
+    let peakDiffIdx = 1;
+    for (let i = 2; i < diffs.length; i++) if (diffs[i] > diffs[peakDiffIdx]) peakDiffIdx = i;
+    if (!finalIdx.includes(peakDiffIdx)) finalIdx = [...finalIdx, peakDiffIdx].sort((a, b) => a - b);
 
     const times = finalIdx.map((i) => candTimes[i]);
     return times.map((t, i) => ({ label: `Frame ${i + 1} of ${times.length} — ${fmt(t)}`, t }));
@@ -836,7 +874,7 @@ export default function SwingTracer() {
     if (!v || !duration) return;
     v.pause();
     const resumeT = v.currentTime;
-    setExportState("working");
+    setExportState({ action: "sheet", status: "working" });
     try {
       const frames = await getExportFrames(v);
       const sheet = await buildFrameSheetCanvas(frames);
@@ -848,9 +886,9 @@ export default function SwingTracer() {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setExportState("done");
+      setExportState({ action: "sheet", status: "done" });
     } catch (err) {
-      setExportState("idle");
+      setExportState({ action: null, status: "idle" });
       setAiState("error");
       setAiError("Frame export failed: " + String(err?.message || err));
     }
@@ -861,15 +899,15 @@ export default function SwingTracer() {
     if (!v || !duration) return;
     v.pause();
     const resumeT = v.currentTime;
-    setExportState("working");
+    setExportState({ action: "prompt", status: "working" });
     try {
       const frames = await getExportFrames(v);
       v.currentTime = resumeT;
       navigator.clipboard?.writeText(buildChatPromptText(frames));
-      setExportState("copied");
-      setTimeout(() => setExportState("idle"), 2500);
+      setExportState({ action: "prompt", status: "copied" });
+      setTimeout(() => setExportState({ action: null, status: "idle" }), 2500);
     } catch (err) {
-      setExportState("idle");
+      setExportState({ action: null, status: "idle" });
       setAiState("error");
       setAiError("Building the chat prompt failed: " + String(err?.message || err));
       if (videoRef.current) videoRef.current.currentTime = resumeT;
@@ -888,7 +926,7 @@ export default function SwingTracer() {
     if (!v || !duration) return;
     v.pause();
     const resumeT = v.currentTime;
-    setExportState("working");
+    setExportState({ action: "share", status: "working" });
     try {
       const frames = await getExportFrames(v);
       const sheet = await buildFrameSheetCanvas(frames);
@@ -900,7 +938,7 @@ export default function SwingTracer() {
 
       if (navigator.canShare?.({ files: [file] })) {
         await navigator.share({ files: [file], text, title: "Swing analysis" });
-        setExportState("done");
+        setExportState({ action: "share", status: "done" });
       } else {
         // no native file sharing here — fall back to the two-step flow, but
         // still do it in one tap: download the image, copy the prompt
@@ -912,11 +950,11 @@ export default function SwingTracer() {
         a.remove();
         navigator.clipboard?.writeText(text);
         setAiError("This browser can't share files directly — downloaded the frame sheet and copied the prompt instead. Open Claude and attach + paste manually.");
-        setExportState("copied");
-        setTimeout(() => setExportState("idle"), 4000);
+        setExportState({ action: "share", status: "copied" });
+        setTimeout(() => setExportState({ action: null, status: "idle" }), 4000);
       }
     } catch (err) {
-      setExportState("idle");
+      setExportState({ action: null, status: "idle" });
       if (String(err?.name) !== "AbortError") {
         // AbortError = user just closed the share sheet, not a real failure
         setAiState("error");
@@ -940,7 +978,7 @@ export default function SwingTracer() {
     setAiError("");
     setAiResult(null);
     try {
-      const frames = await getExportFrames(v);
+      const frames = await getExportFrames(v, 18); // cap here only — real cost/latency per image on the paid API path
 
       const shots = [];
       for (const fr of frames) {
@@ -1382,9 +1420,9 @@ export default function SwingTracer() {
                     <button
                       className="btn primary"
                       onClick={shareSwing}
-                      disabled={!src || !duration || exportState === "working"}
+                      disabled={!src || !duration || exportBusy}
                     >
-                      {exportState === "working" ? "Preparing…" : "📤 Share to Claude"}
+                      {exportState.action === "share" && exportBusy ? "Preparing…" : "📤 Share to Claude"}
                     </button>
                   </div>
                   <p className="hint" style={{ marginTop: 6 }}>
@@ -1397,12 +1435,16 @@ export default function SwingTracer() {
                 <button
                   className="btn"
                   onClick={exportFrameSheet}
-                  disabled={!src || !duration || exportState === "working"}
+                  disabled={!src || !duration || exportBusy}
                 >
-                  {exportState === "working" ? "Building sheet…" : "1 · Download frame sheet"}
+                  {exportState.action === "sheet" && exportBusy ? "Building sheet…" : "1 · Download frame sheet"}
                 </button>
-                <button className="btn" onClick={copyChatPrompt} disabled={!duration || exportState === "working"}>
-                  {exportState === "working" ? "Building prompt…" : exportState === "copied" ? "Copied ✓" : "2 · Copy chat prompt"}
+                <button className="btn" onClick={copyChatPrompt} disabled={!duration || exportBusy}>
+                  {exportState.action === "prompt" && exportBusy
+                    ? "Building prompt…"
+                    : exportState.action === "prompt" && exportState.status === "copied"
+                    ? "Copied ✓"
+                    : "2 · Copy chat prompt"}
                 </button>
               </div>
             </div>
