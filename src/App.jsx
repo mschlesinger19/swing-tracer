@@ -844,11 +844,20 @@ export default function SwingTracer() {
     new Promise((resolve) => {
       let handle = null, done = false;
       capturingRef.current = true;
+      // Capture reads meta.mediaTime, so playback rate doesn't affect WHICH
+      // frames we get — only how fast. Force 1× for the pass: the UI leaves
+      // the element at the slow-motion review speed (default 0.5×), and the
+      // guard timeout below is sized for 1×, so inheriting 0.5× made the
+      // guard trip at the halfway point and truncate the buffer mid-swing
+      // (observed: a 0.30–15.50s window captured only 0.31–10.61s, dropping
+      // the entire follow-through). Restore the UI rate when done.
+      const rate0 = v.playbackRate;
       const finish = () => {
         if (done) return;
         done = true;
         capturingRef.current = false;
         try { v.pause(); } catch {}
+        try { v.playbackRate = rate0; } catch {}
         if (handle != null && "cancelVideoFrameCallback" in v) v.cancelVideoFrameCallback(handle);
         v.removeEventListener("ended", finish);
         clearTimeout(guard);
@@ -865,6 +874,7 @@ export default function SwingTracer() {
       const guard = setTimeout(finish, (t1 - t0) * 1000 + 6000);
       const begin = () => {
         if (done) return;
+        try { v.playbackRate = 1; } catch {}
         handle = v.requestVideoFrameCallback(cb);
         const p = v.play();
         if (p && p.catch) p.catch(() => finish());
@@ -1147,8 +1157,27 @@ export default function SwingTracer() {
     let impactMethod = `motion peak only (no impact click, no ball detectable), sharpness ${peakSharp.toFixed(1)}× median — low trust`;
 
     // ---- pass 2: audio impact click (rule 2) — the primary refiner ----
+    // The click normally must corroborate the motion peak (window skewed to
+    // sit just before it, since motion peaks tend to lag contact). That gate
+    // rejects coughs, club-taps and bag drops — but it assumes a RELIABLE
+    // motion peak, which slow-motion destroys: the strike's motion blur is
+    // gone, so the per-frame motion profile goes flat and its "peak" is noise
+    // (observed on a real slow-mo clip: a decisive strike at 10.42s — 165×
+    // ambient, 19× the next transient — was rejected because the motion peak
+    // had wandered to 10.00s and the +0.4s window closed at 10.40s, missing
+    // it by 0.02s; the sheet then anchored on the garbage peak). A DECISIVE
+    // click is, by definition, the loudest broadband event in the marked
+    // swing by a wide margin over BOTH ambient and every other transient —
+    // it IS the strike and needs no corroboration, so it bypasses the
+    // proximity gate. On a normal-speed clip a decisive click already sits on
+    // the motion peak, so the bypass is a no-op there; it only changes the
+    // outcome on the slow-mo clips the peak can't handle. Weaker clicks still
+    // require agreement with the motion peak.
     const click = await detectImpactClick(start, end);
-    if (click && click.ratio >= 12 && click.dominance >= 2 && click.t >= peakT - 0.9 && click.t <= peakT + 0.4) {
+    const clickDecisive = click && click.ratio >= 20 && click.dominance >= 6;
+    const clickCorroborated =
+      click && click.ratio >= 12 && click.dominance >= 2 && click.t >= peakT - 0.9 && click.t <= peakT + 0.4;
+    if (clickDecisive || clickCorroborated) {
       impactT = snap(click.t);
       impactTrusted = true;
       // strong tier (agent's A2 gate): ≥20× ambient AND ≥5× the next
@@ -1157,7 +1186,9 @@ export default function SwingTracer() {
       // tier still enforces the post-cap and ends core coverage at impact.
       impactStrong = click.ratio >= 20 && click.dominance >= 5;
       impactAudio = click;
-      impactMethod = `audio impact click, ${click.ratio.toFixed(0)}× ambient, ${click.dominance.toFixed(1)}× next transient`;
+      impactMethod =
+        `audio impact click, ${click.ratio.toFixed(0)}× ambient, ${click.dominance.toFixed(1)}× next transient` +
+        (clickDecisive && !clickCorroborated ? " (decisive — motion peak overridden)" : "");
     } else if (click) {
       console.info(
         `[frames] audio click rejected: t=${click.t.toFixed(2)} ratio=${click.ratio.toFixed(1)} ` +
