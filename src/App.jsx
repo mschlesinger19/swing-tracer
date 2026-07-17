@@ -329,6 +329,11 @@ export default function SwingTracer() {
   // exportBusy below) still gates the shared single-occupancy video access
   const [exportState, setExportState] = useState({ action: null, status: "idle" });
   const exportBusy = exportState.status === "working";
+  // Prepared { file, text } awaiting the actual share tap. iOS Safari revokes
+  // the Web Share permission if the seconds of frame capture happen between
+  // the tap and navigator.share(), so we split it: first tap builds this,
+  // second tap shares inside a fresh user gesture with no async before it.
+  const [shareReady, setShareReady] = useState(null);
   const [apiKey, setApiKey] = useState(() => {
     try { return localStorage.getItem("swing-tracer-api-key") || ""; } catch { return ""; }
   });
@@ -500,11 +505,28 @@ export default function SwingTracer() {
       try { v.currentTime = t0; } catch {}
     }
     if (deltas.length < 6) return; // not enough evidence — keep the default
-    deltas.sort((a, b) => a - b);
-    const raw = 1 / deltas[Math.floor(deltas.length * 0.25)];
+    // Snap each frame-to-frame delta to a common rate and take the MODE.
+    // The old 25th-percentile estimate was biased toward the SMALLEST
+    // deltas, so a little rVFC jitter (a couple of half-length deltas) made
+    // it read a 30fps clip as 60. Voting is robust to that AND to dropped
+    // frames (double-length deltas): both are minority votes, the true rate
+    // wins the count.
     const common = [24, 25, 30, 50, 60, 100, 120, 240];
-    const detected = common.find((c) => Math.abs(raw - c) / c < 0.1) ?? Math.round(raw);
-    console.info(`[fps] detected ${detected} (raw ${raw.toFixed(2)} from ${deltas.length} deltas)`);
+    const votes = new Map();
+    for (const d of deltas) {
+      if (d < 1 / 300 || d > 1 / 10) continue; // implausible frame duration
+      const f = 1 / d;
+      const snapped = common.find((c) => Math.abs(f - c) / c < 0.15);
+      if (snapped) votes.set(snapped, (votes.get(snapped) || 0) + 1);
+    }
+    let detected = 0, best = 0;
+    for (const [f, n] of votes) if (n > best) { best = n; detected = f; }
+    if (!detected) {
+      // no consensus with a common rate — fall back to the median delta
+      deltas.sort((a, b) => a - b);
+      detected = Math.round(1 / deltas[Math.floor(deltas.length / 2)]);
+    }
+    console.info(`[fps] detected ${detected} (${best}/${deltas.length} votes; rates ${[...votes].map(([f, n]) => `${f}:${n}`).join(",")})`);
     if (!fpsManualRef.current) {
       setFps(detected);
       setFpsSource("detected");
@@ -531,6 +553,11 @@ export default function SwingTracer() {
     ro.observe(el);
     return () => ro.disconnect();
   }, [src]);
+
+  // A prepared share payload goes stale the moment the frame selection could
+  // change (new clip, new swing bounds, or camera angle) — drop it so the
+  // next share tap rebuilds rather than sending an outdated sheet.
+  useEffect(() => { setShareReady(null); }, [src, markers, view]);
 
   // scale multiplies the pixel-sized bits (stroke, dots, chip) so the same
   // markup keeps its weight whether drawn on the ~360px preview canvas
@@ -779,7 +806,14 @@ export default function SwingTracer() {
         // fallback path if frame callbacks stay silent: give decode a beat
         grace = setTimeout(finish, 200);
       };
-      const backstop = setTimeout(finish, 900); // absolute: never hang
+      // Absolute ceiling so a seek can never hang. Was 900ms, but mobile
+      // Safari's seek+decode routinely exceeds that on larger clips — the
+      // backstop then fired before 'seeked', capturing the PREVIOUS (stale)
+      // frame, which is a prime suspect for sheets that grab the wrong part
+      // of the swing on device. 2.5s clears real mobile decode latency; it
+      // only affects the rare seek where both the frame callback and the
+      // 'seeked' event stay silent, so the common path is unchanged.
+      const backstop = setTimeout(finish, 2500);
       if (Math.abs((v.currentTime || 0) - t) < 0.001) {
         requestAnimationFrame(() => requestAnimationFrame(finish));
         return;
@@ -1151,7 +1185,12 @@ export default function SwingTracer() {
     let ftStart = end;
     for (let i = N - 1; i > impactScanIdx; i--) if (smoothM[i] > moveThresh) { ftStart = scanTimes[i]; break; }
     const activeSwing = ftStart - addressEndT;
-    const slowmo = activeSwing > 3.0;
+    // A real swing's active motion tops out ~2.2s; a loosely-marked or
+    // unbounded clip stretches that toward ~3s as dead time at the ends
+    // leaks in (measured 3.07s on golfer-1 exported with no bounds). Slow-mo
+    // (4-8× stretch) lands at 5s+, so 4.0s cleanly separates real slow-mo
+    // from a normal swing that just wasn't tightly bounded.
+    const slowmo = activeSwing > 4.0;
 
     // ---- rule 4 (A3): deterministic post-impact frames, anchored to the
     // ACTIVE follow-through [impact, ftStart] rather than absolute offsets,
@@ -1575,16 +1614,40 @@ export default function SwingTracer() {
     }
   };
 
-  // One-tap path: build the same frame sheet + prompt, then hand them to the
-  // OS share sheet (navigator.share) so the user can pick "Claude" directly
-  // if it's installed and registered as a share target — no known way to
-  // deep-link/pre-fill claude.ai itself, so this is the closest "one click
-  // into Claude" that's actually achievable with standard web APIs. Falls
-  // back to the existing download+copy flow where file sharing isn't
-  // supported (e.g. most desktop browsers).
+  // Build the frame sheet + prompt and hand them to the OS share sheet
+  // (navigator.share) so the user can pick "Claude" directly if it's
+  // installed as a share target — no known way to deep-link/pre-fill
+  // claude.ai itself, so this is the closest "into Claude" achievable with
+  // standard web APIs.
+  //
+  // TWO TAPS on purpose: iOS Safari only allows navigator.share() while a
+  // user gesture is still "active", and the seconds of frame capture
+  // between the tap and the share revoked it — the exact "request is not
+  // allowed by the user agent" error seen on device. So the first tap
+  // captures + builds the file and stashes it (shareReady); the second tap
+  // calls share() synchronously inside a fresh gesture. Desktop browsers
+  // without file sharing keep the one-tap download+copy fallback.
   const shareSwing = async () => {
     const v = videoRef.current;
     if (!v || !duration) return;
+
+    // Second tap: payload already built — share now, no async beforehand.
+    if (shareReady) {
+      try {
+        await navigator.share({ files: [shareReady.file], text: shareReady.text, title: "Swing analysis" });
+      } catch (err) {
+        if (String(err?.name) !== "AbortError") {
+          setAiState("error");
+          setAiError("Share failed: " + String(err?.message || err));
+        }
+      } finally {
+        setShareReady(null);
+        setExportState({ action: null, status: "idle" });
+      }
+      return;
+    }
+
+    // First tap: capture + build, then stash for the share tap.
     v.pause();
     const resumeT = v.currentTime;
     setExportState({ action: "share", status: "working" });
@@ -1598,8 +1661,8 @@ export default function SwingTracer() {
       const file = new File([blob], `swing-${view}-frames.jpg`, { type: "image/jpeg" });
 
       if (navigator.canShare?.({ files: [file] })) {
-        await navigator.share({ files: [file], text, title: "Swing analysis" });
-        setExportState({ action: "share", status: "done" });
+        setShareReady({ file, text });
+        setExportState({ action: "share", status: "ready" });
       } else {
         // no native file sharing here — fall back to the two-step flow, but
         // still do it in one tap: download the image, copy the prompt
@@ -1616,11 +1679,8 @@ export default function SwingTracer() {
       }
     } catch (err) {
       setExportState({ action: null, status: "idle" });
-      if (String(err?.name) !== "AbortError") {
-        // AbortError = user just closed the share sheet, not a real failure
-        setAiState("error");
-        setAiError("Share failed: " + String(err?.message || err));
-      }
+      setAiState("error");
+      setAiError("Share prep failed: " + String(err?.message || err));
       if (videoRef.current) videoRef.current.currentTime = resumeT;
     }
   };
@@ -2112,11 +2172,17 @@ export default function SwingTracer() {
                       onClick={shareSwing}
                       disabled={!src || !duration || exportBusy}
                     >
-                      {exportState.action === "share" && exportBusy ? "Preparing…" : "📤 Share to Claude"}
+                      {exportState.action === "share" && exportBusy
+                        ? "Preparing frames…"
+                        : shareReady
+                        ? "📤 Tap again to open share sheet"
+                        : "📤 Share to Claude"}
                     </button>
                   </div>
                   <p className="hint" style={{ marginTop: 6 }}>
-                    Opens your device's share sheet with the frame sheet + prompt — pick Claude if it's installed.
+                    {shareReady
+                      ? "Frames ready — tap again to open the share sheet and pick Claude. (Two taps because iOS only allows the share sheet to open on a direct tap.)"
+                      : "Builds the frame sheet + prompt, then opens your device's share sheet — pick Claude if it's installed."}
                   </p>
                   <p className="hint" style={{ marginTop: 10 }}>Or do it manually:</p>
                 </>
