@@ -505,11 +505,28 @@ export default function SwingTracer() {
       try { v.currentTime = t0; } catch {}
     }
     if (deltas.length < 6) return; // not enough evidence — keep the default
-    deltas.sort((a, b) => a - b);
-    const raw = 1 / deltas[Math.floor(deltas.length * 0.25)];
+    // Snap each frame-to-frame delta to a common rate and take the MODE.
+    // The old 25th-percentile estimate was biased toward the SMALLEST
+    // deltas, so a little rVFC jitter (a couple of half-length deltas) made
+    // it read a 30fps clip as 60. Voting is robust to that AND to dropped
+    // frames (double-length deltas): both are minority votes, the true rate
+    // wins the count.
     const common = [24, 25, 30, 50, 60, 100, 120, 240];
-    const detected = common.find((c) => Math.abs(raw - c) / c < 0.1) ?? Math.round(raw);
-    console.info(`[fps] detected ${detected} (raw ${raw.toFixed(2)} from ${deltas.length} deltas)`);
+    const votes = new Map();
+    for (const d of deltas) {
+      if (d < 1 / 300 || d > 1 / 10) continue; // implausible frame duration
+      const f = 1 / d;
+      const snapped = common.find((c) => Math.abs(f - c) / c < 0.15);
+      if (snapped) votes.set(snapped, (votes.get(snapped) || 0) + 1);
+    }
+    let detected = 0, best = 0;
+    for (const [f, n] of votes) if (n > best) { best = n; detected = f; }
+    if (!detected) {
+      // no consensus with a common rate — fall back to the median delta
+      deltas.sort((a, b) => a - b);
+      detected = Math.round(1 / deltas[Math.floor(deltas.length / 2)]);
+    }
+    console.info(`[fps] detected ${detected} (${best}/${deltas.length} votes; rates ${[...votes].map(([f, n]) => `${f}:${n}`).join(",")})`);
     if (!fpsManualRef.current) {
       setFps(detected);
       setFpsSource("detected");
@@ -1168,7 +1185,12 @@ export default function SwingTracer() {
     let ftStart = end;
     for (let i = N - 1; i > impactScanIdx; i--) if (smoothM[i] > moveThresh) { ftStart = scanTimes[i]; break; }
     const activeSwing = ftStart - addressEndT;
-    const slowmo = activeSwing > 3.0;
+    // A real swing's active motion tops out ~2.2s; a loosely-marked or
+    // unbounded clip stretches that toward ~3s as dead time at the ends
+    // leaks in (measured 3.07s on golfer-1 exported with no bounds). Slow-mo
+    // (4-8× stretch) lands at 5s+, so 4.0s cleanly separates real slow-mo
+    // from a normal swing that just wasn't tightly bounded.
+    const slowmo = activeSwing > 4.0;
 
     // ---- rule 4 (A3): deterministic post-impact frames, anchored to the
     // ACTIVE follow-through [impact, ftStart] rather than absolute offsets,
