@@ -532,20 +532,23 @@ export default function SwingTracer() {
     return () => ro.disconnect();
   }, [src]);
 
-  const drawShape = useCallback((ctx, s, w, h) => {
+  // scale multiplies the pixel-sized bits (stroke, dots, chip) so the same
+  // markup keeps its weight whether drawn on the ~360px preview canvas
+  // (scale 1) or composited onto a full-resolution frame for export.
+  const drawShape = useCallback((ctx, s, w, h, scale = 1) => {
     ctx.strokeStyle = s.color;
     ctx.fillStyle = s.color;
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 3 * scale;
     ctx.lineCap = "round";
     const P = (p) => ({ x: p.x * w, y: p.y * h });
 
     const chip = (text, x, y) => {
-      ctx.font = "600 12px 'JetBrains Mono', ui-monospace, monospace";
+      ctx.font = `600 ${12 * scale}px 'JetBrains Mono', ui-monospace, monospace`;
       const tw = ctx.measureText(text).width;
       ctx.save();
       ctx.fillStyle = "rgba(10,14,11,0.85)";
       ctx.beginPath();
-      ctx.roundRect(x - 6, y - 16, tw + 12, 22, 5);
+      ctx.roundRect(x - 6 * scale, y - 16 * scale, tw + 12 * scale, 22 * scale, 5 * scale);
       ctx.fill();
       ctx.restore();
       ctx.fillText(text, x, y);
@@ -558,7 +561,7 @@ export default function SwingTracer() {
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
       const deg = lineAngleDeg(s.pts[0], s.pts[1], w, h);
-      chip(`${deg.toFixed(1)}°`, (a.x + b.x) / 2 + 8, (a.y + b.y) / 2 - 8);
+      chip(`${deg.toFixed(1)}°`, (a.x + b.x) / 2 + 8 * scale, (a.y + b.y) / 2 - 8 * scale);
     }
     if (s.type === "circle") {
       const c = P(s.pts[0]), e = P(s.pts[1]);
@@ -576,7 +579,7 @@ export default function SwingTracer() {
       ctx.stroke();
       [a, v, b].forEach((p) => {
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, 4 * scale, 0, Math.PI * 2);
         ctx.fill();
       });
       const deg = angleBetween(
@@ -584,7 +587,7 @@ export default function SwingTracer() {
         { x: v.x, y: v.y },
         { x: b.x, y: b.y }
       );
-      chip(`${deg.toFixed(1)}°`, v.x + 12, v.y - 12);
+      chip(`${deg.toFixed(1)}°`, v.x + 12 * scale, v.y - 12 * scale);
     }
   }, []);
 
@@ -711,6 +714,36 @@ export default function SwingTracer() {
   const captureFrame = async (t) => (await captureFrameCanvas(t)).toDataURL("image/jpeg", 0.7).split(",")[1];
 
   const captureCanvasAt = (t) => captureFrameCanvas(t);
+
+  // Save the frame currently on screen with its drawn markup (plane lines,
+  // angles, circles) baked in, as one annotated still. Shapes are stored in
+  // normalized coords and the preview canvas covers the video 1:1, so they
+  // composite straight onto a native-resolution capture; scale keeps their
+  // stroke/label weight proportional at the larger export size.
+  const exportAnnotatedFrame = async () => {
+    const v = videoRef.current;
+    if (!v || !duration) return;
+    v.pause();
+    const resumeT = v.currentTime;
+    try {
+      const nativeShort = Math.min(v.videoWidth, v.videoHeight) || 720;
+      const canvas = await captureFrameCanvas(resumeT, Math.max(720, nativeShort));
+      const ctx = canvas.getContext("2d");
+      const scale = canvas.width / (stageSize.w || canvas.width);
+      shapes.forEach((s) => drawShape(ctx, s, canvas.width, canvas.height, scale));
+      const a = document.createElement("a");
+      a.href = canvas.toDataURL("image/jpeg", 0.92);
+      a.download = `swing-${view}-${fmt(resumeT).replace(/[:.]/g, "")}.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      setAiState("error");
+      setAiError("Frame save failed: " + String(err?.message || err));
+    } finally {
+      try { v.currentTime = resumeT; } catch {}
+    }
+  };
 
   /* ---------- auto position detection (motion energy) ---------- */
 
@@ -1855,6 +1888,7 @@ export default function SwingTracer() {
               ))}
               <button className="btn small" onClick={() => setShapes((s) => s.slice(0, -1))}>Undo</button>
               <button className="btn small" onClick={() => { setShapes([]); setAnglePts([]); }}>Clear</button>
+              <button className="btn small" onClick={exportAnnotatedFrame} title="Save this frame with your drawn lines/angles baked in">⬇ Save frame</button>
             </div>
             {tool === "angle" && (
               <div className="hint" style={{ marginTop: 6 }}>
