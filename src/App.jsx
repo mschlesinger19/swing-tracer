@@ -1626,6 +1626,24 @@ export default function SwingTracer() {
           source: { type: "base64", media_type: "image/jpeg", data: s.b64 },
         });
       });
+
+      // User-supplied context — the golfer's own focus areas and suspected
+      // misses. The keyless chat-export prompt already forwards these; the
+      // direct API path didn't, despite the UI promising it does. Framed as
+      // a hint so it can't manufacture faults the frames don't show.
+      const userContext = [];
+      const flaggedNames = allFlagged.map((f) => f.name);
+      if (flaggedNames.length)
+        userContext.push(`The golfer has already flagged these as suspected issues: ${flaggedNames.join(", ")}.`);
+      if (notes.trim()) userContext.push(`The golfer's session notes: ${notes.trim()}`);
+      if (userContext.length)
+        content.push({
+          type: "text",
+          text:
+            userContext.join(" ") +
+            " Weigh this as context, but base every observation and fault on what is actually visible in the frames.",
+        });
+
       content.push({
         type: "text",
         text:
