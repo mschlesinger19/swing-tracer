@@ -1095,33 +1095,64 @@ export default function SwingTracer() {
     // no impact frame at all.
     let times = [...new Set([...sparse, ...denseTimes, snap(impactT), snap(end)].map(snap))].sort((a, b) => a - b);
 
-    // ---- rule 4 (A3): exactly three post-impact frames at deterministic
-    // offsets — impact+0.10 (release: shaft/path/extension), impact+0.35
-    // (mid follow-through: rotation/posture), swing_end (finish/balance).
-    // The +0.35 frame yields to A1: if either post gap would exceed the 25%
-    // ceiling, the middle frame is rebalanced to the midpoint of release→end
-    // (this is exactly what the approved golfer-2 baseline does — its +0.35
-    // lands at 1.78 but the sheet uses 1.97 to keep the finish gap legal).
-    // All post-impact frames are protected from the dedupe and count passes
-    // so the count stays exactly 3.
-    // Only impose the exact-3 canonical set when impact is TRUSTED. On an
-    // unconfirmed estimate the offsets would hang off a possibly-wrong
-    // anchor, and the coverage safety net below (which still spans 40-85%
-    // of the window when untrusted) is the right behavior instead — so fall
-    // back to the loose "keep first/mid/last of whatever's there" cap.
+    // ---- swing timing from the motion scan (no extra seeks). The address
+    // and finish HOLDS are genuinely static, so they detect cleanly — unlike
+    // the top of the backswing, whose motion contrast at 96px is too low to
+    // locate reliably (measured: threshold-sensitive, overshoots into the
+    // address hold and mis-flags normal clips). ftStart = end of the
+    // follow-through motion (= start of the finish hold, or the marked end
+    // if the clip ends still moving); activeSwing = takeaway-start→ftStart.
+    // A real swing's active motion is physically ≤~2.2s, so activeSwing >3s
+    // means slow-motion (the swing stretched across more video-time) — a
+    // robust flag that per-frame pixel motion can't give (that's confounded
+    // by subject size and framing).
+    const smoothM = scanDiffs.map((_, i) =>
+      (scanDiffs[Math.max(0, i - 1)] + scanDiffs[i] + scanDiffs[Math.min(N - 1, i + 1)]) / 3
+    );
+    const mSorted = [...smoothM].slice(1).sort((a, b) => a - b);
+    const mP20 = mSorted[Math.floor(mSorted.length * 0.2)] || 0;
+    const moveThresh = mP20 + 0.15 * (Math.max(...smoothM) - mP20);
+    let addressEndT = start;
+    for (let i = 1; i < N; i++) if (smoothM[i] > moveThresh) { addressEndT = scanTimes[i]; break; }
+    const impactScanIdx = Math.max(1, scanTimes.findIndex((t) => t >= impactT - 1e-6));
+    let ftStart = end;
+    for (let i = N - 1; i > impactScanIdx; i--) if (smoothM[i] > moveThresh) { ftStart = scanTimes[i]; break; }
+    const activeSwing = ftStart - addressEndT;
+    const slowmo = activeSwing > 3.0;
+
+    // ---- rule 4 (A3): deterministic post-impact frames, anchored to the
+    // ACTIVE follow-through [impact, ftStart] rather than absolute offsets,
+    // so the mid-follow-through frame lands in real body rotation instead of
+    // a long static finish hold. Normal clip → 3 frames (release, mid-FT,
+    // finish); slow-motion → 4 (release, two across the stretched FT, finish)
+    // since the follow-through spans much more video-time. release stays
+    // impact+0.10 (the just-past-the-ball read). The mid frame yields to A1:
+    // if a post gap would break the 25% ceiling it rebalances to the
+    // release→end midpoint. On the golfer-2 baseline ftStart = end (the clip
+    // finishes still moving), so mid-FT = 1.97 exactly as before. All
+    // post-impact frames are protected from the dedupe and count passes.
+    // Only impose the canonical set when impact is TRUSTED — an unconfirmed
+    // estimate keeps the 40-85% coverage safety net instead.
     const postProtected = new Set();
     if (impactTrusted) {
-      const p0 = snap(impactT + 0.1);
-      const pEnd = snap(end);
-      let p1 = snap(impactT + 0.35);
-      if (p1 - p0 > 0.25 * span || pEnd - p1 > 0.25 * span) p1 = snap((p0 + pEnd) / 2);
-      const canon = [...new Set([p0, p1, pEnd])]
+      const p0 = snap(impactT + 0.1); // release
+      const pEnd = snap(end); // finish (held)
+      const ft = Math.max(ftStart, p0 + frameDur); // guard degenerate holds
+      const canon = [p0];
+      if (slowmo) {
+        canon.push(snap(p0 + (ft - p0) / 3), snap(p0 + (2 * (ft - p0)) / 3), pEnd);
+      } else {
+        let mid = snap((p0 + ft) / 2);
+        if (mid - p0 > 0.25 * span || pEnd - mid > 0.25 * span) mid = snap((p0 + pEnd) / 2);
+        canon.push(mid, pEnd);
+      }
+      const canonU = [...new Set(canon)]
         .filter((t) => t > impactT + frameDur / 2 && t <= end + 1e-9)
         .sort((a, b) => a - b);
       times = times.filter((t) => t <= impactT + frameDur / 2);
-      times.push(...canon);
+      times.push(...canonU);
       times = [...new Set(times.map(snap))].sort((a, b) => a - b);
-      for (const t of canon) postProtected.add(t);
+      for (const t of canonU) postProtected.add(t);
     } else {
       const post = times.filter((t) => t > impactT + frameDur / 2);
       if (post.length > 3) {
@@ -1289,7 +1320,8 @@ export default function SwingTracer() {
       maxCore = Math.max(maxCore, Math.min(times[i + 1], coreB) - Math.max(times[i], coreA));
     }
     const postN = times.filter((t) => t > impactT + frameDur / 2).length;
-    const postOk = !impactTrusted || postN === 3;
+    const postBudget = slowmo ? 4 : 3;
+    const postOk = !impactTrusted || postN === postBudget;
     const impactPresent = times.some((t) => Math.abs(t - impactT) < frameDur / 2);
     const pass =
       maxAny <= 0.25 * span + 1e-6 && maxCore <= coreGap + 1e-6 && times.length >= 12 && postOk && impactPresent;
@@ -1314,9 +1346,10 @@ export default function SwingTracer() {
     const impactStat = impactAudio
       ? `impact ${impactT.toFixed(2)}s audio ${impactAudio.ratio.toFixed(0)}×/${impactAudio.dominance.toFixed(1)}× ${conf}`
       : `impact ${impactT.toFixed(2)}s ${impactTrusted ? "ball-departure CONFIRMED" : "motion-peak UNCONFIRMED"}`;
+    const swingStat = `swing ${activeSwing.toFixed(2)}s${slowmo ? " SLOW-MO" : ""}`;
     const statsLine =
       `max_gap ${maxAny.toFixed(2)}s | core_gap ${Math.max(0, maxCore).toFixed(2)}s | ` +
-      `post_impact ${postN}/3 | ${impactStat} | frames ${times.length} | ${pass ? "PASS" : "FAIL"}`;
+      `post_impact ${postN}/${postBudget} | ${impactStat} | ${swingStat} | frames ${times.length} | ${pass ? "PASS" : "FAIL"}`;
     console.info(`[frames] ${statsLine} · impact frame ${impactPresent ? "present" : "MISSING"} · deduped ${dedupedN}`);
 
     const out = times.map((t, i) => {
