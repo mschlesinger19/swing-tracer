@@ -1,0 +1,46 @@
+Jotting these down now - Things to consider for future iterations:
+
+DONE:
+[x] Making AI coach the first tab, consolidated Checkpoints + Faults & drills into "Golf Swing Mechanics"
+[x] Removed auto-detect entirely (motion-energy + MediaPipe pose, spike graph) in favor of manual swing start/end marking + keyframe-dedup export sampling
+[x] Step-by-step "How to use" instructions (dismissible banner, first load)
+[x] Cropping video based on swing start/end inputs - satisfied by the existing "Loop swing" button (restricts playback/review to the marked bounds); trimming/downloading an actual shorter video file was not the intent
+[x] Move API Key for AI Coach into a settings page - new "Settings" tab; AI coach tab shows a link there if no key is set
+[x] One click export/copy/launch to claude app - added a "📤 Share to Claude" button using navigator.share() (Web Share API): builds the frame sheet + prompt and hands them to the OS share sheet in one tap, so Claude can be picked directly if installed as a share target. Only shown on devices/browsers that support file sharing (mainly mobile); falls back to the existing download+copy flow elsewhere. No way to auto pre-fill a claude.ai chat via URL exists, so this is the closest one-tap path achievable with standard web APIs - not yet verified on a real device with the Claude app installed.
+
+REMAINING (re-estimated after checking the code):
+
+1. Text field to give claude more context (misses, focus areas, etc.)
+   - Mostly already done - the "Session notes" field already exists and already feeds the keyless
+     chat-export prompt. Gap: it's NOT included in the direct AI Coach API call (runAnalysis) - just
+     needs wiring in, not new UI.
+   - Size: small
+
+2. Export with markups (drawn lines/angles/circles baked into an exported image)
+   - Smaller than expected - drawn shapes aren't tied to timestamps, they're just an overlay on
+     whatever frame you're currently viewing. Realistic scope: export the CURRENT frame with its
+     markup as one annotated image, not making the whole automated multi-frame export markup-aware.
+   - Size: small-medium
+
+3. Speed/FPS - are these being used?
+   - Answered: yes, both actively used. `speed` drives actual video.playbackRate; `fps` drives the
+     frame-step increment (Frame buttons) and is included as clip context in the AI/chat prompt.
+     Nothing to clean up.
+
+4. Mobile: stuck on "Loading" until you tap play (first frame doesn't paint)
+   - Real bug. There's already a primeFirstFrame() mechanism meant to solve exactly this (muted
+     play-one-frame-pause-rewind), and it's apparently not fully reliable on mobile. iOS Safari
+     video-decode timing is input-dependent - needs on-device iteration, can't be fully verified
+     from a dev environment alone.
+   - Size: medium
+
+5. Make the "How to use" intro banner dismiss permanently after first view
+   - Blocked on real persistence (Supabase, roadmap item) rather than an ad-hoc localStorage flag.
+   - Size: small once persistence exists; not worth doing standalone before then
+
+6. Allow for simultaneous DTL and face-on video analysis into claude
+   - Bigger than it sounds: the app currently holds one video/marker/shape set at a time - the
+     DTL/face-on toggle only switches which reference content (checkpoints/faults) displays, not
+     actual dual-video support. Would need real dual-video state, independent swing bounds per
+     angle, and a combined AI prompt.
+   - Size: large - worth its own planning session
