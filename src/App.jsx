@@ -317,6 +317,8 @@ export default function SwingTracer() {
   const primedRef = useRef(false); // first frame painted yet?
   const fpsDetectRef = useRef(false); // fps detection attempted for this clip?
   const fpsManualRef = useRef(false); // user overrode fps for this clip?
+  const playbackBufRef = useRef(null); // during export: frames captured by playback, so sampleLuma reads them instead of seeking (iOS-reliable)
+  const capturingRef = useRef(false); // true while playThrough drives the video — keeps the loop handler off it
   const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error
   const [loadMsg, setLoadMsg] = useState("");
   const fileRef = useRef(null);
@@ -537,7 +539,9 @@ export default function SwingTracer() {
     const v = videoRef.current;
     if (!v) return;
     setTime(v.currentTime);
-    if (loop && markers.p1 != null && markers.p10 != null && markers.p10 > markers.p1) {
+    // don't loop back while an export is PLAYING the window through to
+    // capture frames — that would restart the pass mid-capture
+    if (!capturingRef.current && loop && markers.p1 != null && markers.p10 != null && markers.p10 > markers.p1) {
       if (v.currentTime >= markers.p10) v.currentTime = markers.p1;
     }
   };
@@ -823,7 +827,109 @@ export default function SwingTracer() {
       v.currentTime = t;
     });
 
+  // ---- playback capture (iOS-reliable) ---------------------------------
+  // iOS Safari won't reliably decode/paint a new frame when you seek a
+  // PAUSED video, so seek-then-drawImage returns the last painted (stale)
+  // frame — the on-device bug where every exported frame was the frozen
+  // finish pose. Playback decoding IS reliable, so for export we PLAY the
+  // marked window and grab each frame as it's presented (requestVideoFrame-
+  // Callback reports the exact mediaTime of the frame just painted).
+  const canPlaybackCapture = () =>
+    typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+
+  // Play [t0,t1] once, calling onFrame(mediaTime) for every presented frame
+  // in-window. Muted so mobile autoplay is allowed. Resolves when playback
+  // passes t1, the clip ends, or an absolute time guard trips.
+  const playThrough = (v, t0, t1, onFrame) =>
+    new Promise((resolve) => {
+      let handle = null, done = false;
+      capturingRef.current = true;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        capturingRef.current = false;
+        try { v.pause(); } catch {}
+        if (handle != null && "cancelVideoFrameCallback" in v) v.cancelVideoFrameCallback(handle);
+        v.removeEventListener("ended", finish);
+        clearTimeout(guard);
+        resolve();
+      };
+      const cb = (_now, meta) => {
+        handle = null;
+        if (done) return;
+        const mt = meta.mediaTime;
+        if (mt >= t0 - 1e-3 && mt <= t1 + 0.05) onFrame(mt);
+        if (mt >= t1 - 1e-3) return finish();
+        handle = v.requestVideoFrameCallback(cb);
+      };
+      const guard = setTimeout(finish, (t1 - t0) * 1000 + 6000);
+      const begin = () => {
+        if (done) return;
+        handle = v.requestVideoFrameCallback(cb);
+        const p = v.play();
+        if (p && p.catch) p.catch(() => finish());
+      };
+      v.muted = true;
+      v.addEventListener("ended", finish);
+      const seekTo = Math.max(0, t0 - 0.2);
+      if (Math.abs((v.currentTime || 0) - seekTo) < 0.03) { begin(); return; }
+      const onSeeked = () => { v.removeEventListener("seeked", onSeeked); begin(); };
+      v.addEventListener("seeked", onSeeked);
+      try { v.currentTime = seekTo; } catch { v.removeEventListener("seeked", onSeeked); begin(); }
+      // if the single position seek stalls, start playing anyway (playback
+      // itself decodes; we capture by mediaTime regardless of exact start)
+      setTimeout(() => { if (!done && handle == null) { v.removeEventListener("seeked", onSeeked); begin(); } }, 600);
+    });
+
+  const nearestFrame = (buf, t) => {
+    let best = buf[0], bd = Infinity;
+    for (const f of buf) { const d = Math.abs(f.t - t); if (d < bd) { bd = d; best = f; } }
+    return best;
+  };
+
+  // Build a low-res analysis buffer of the whole window in one playback pass.
+  const bufferAnalysisFrames = async (v, t0, t1, w) => {
+    const h = Math.max(2, Math.round((v.videoHeight / v.videoWidth) * w) || Math.round(w * 0.5625));
+    const buf = [];
+    await playThrough(v, t0, t1, (mt) => {
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      c.getContext("2d", { willReadFrequently: true }).drawImage(v, 0, 0, w, h);
+      buf.push({ t: mt, canvas: c });
+    });
+    return buf;
+  };
+
+  // Second playback pass: capture the nearest presented frame to each target
+  // time at full resolution. Only ~18 canvases are ever held (one per
+  // target), replaced as a closer frame arrives.
+  const bufferTargetFrames = async (v, t0, t1, targets, minShortSide = 720) => {
+    const scale = minShortSide / Math.min(v.videoWidth, v.videoHeight);
+    const cw = Math.round(v.videoWidth * scale), chh = Math.round(v.videoHeight * scale);
+    const out = targets.map((t) => ({ t, canvas: null, bd: Infinity }));
+    await playThrough(v, t0, t1, (mt) => {
+      let capture = null;
+      for (const r of out) {
+        const d = Math.abs(mt - r.t);
+        if (d < r.bd) {
+          if (!capture) {
+            capture = document.createElement("canvas");
+            capture.width = cw; capture.height = chh;
+            capture.getContext("2d").drawImage(v, 0, 0, cw, chh);
+          }
+          r.bd = d; r.canvas = capture;
+        }
+      }
+    });
+    return out;
+  };
+
   const sampleLuma = async (t, w, h, ctx) => {
+    const buf = playbackBufRef.current;
+    if (buf && buf.length) {
+      ctx.drawImage(nearestFrame(buf, t).canvas, 0, 0, w, h);
+      return ctx.getImageData(0, 0, w, h).data;
+    }
     const v = videoRef.current;
     await seekAndPaint(v, t);
     ctx.drawImage(v, 0, 0, w, h);
@@ -981,6 +1087,7 @@ export default function SwingTracer() {
   //     window), splitting gaps >0.30s — previously ~0.5s takeaway gaps
   //     left no shaft-parallel-back frame
   const getExportFrames = async (v, maxCount = 18) => {
+    playbackBufRef.current = null; // clear any leak from a prior failed run
     // P1/P10 marked by hand are the reliable bounds; if either isn't marked,
     // fall back to the whole clip rather than guessing at where the swing is
     const start = markers.p1 ?? 0;
@@ -998,6 +1105,15 @@ export default function SwingTracer() {
     };
     const lo = mkCtx(96); // coarse motion scan
     const hi = mkCtx(192); // ball ROI work — the ball is tiny at 96px
+
+    // Source all analysis frames from ONE playback pass (iOS-reliable) rather
+    // than per-sample seeks. sampleLuma reads playbackBufRef when it's set.
+    const usePlayback = canPlaybackCapture();
+    const resumeT0 = v.currentTime;
+    if (usePlayback) {
+      const abuf = await bufferAnalysisFrames(v, start, end, hi.w);
+      playbackBufRef.current = abuf.length >= 2 ? abuf : null;
+    }
 
     // ---- pass 1: coarse motion scan over the whole window → peak = hint ----
     const N = 48;
@@ -1443,6 +1559,15 @@ export default function SwingTracer() {
       };
     });
     out.stats = { line: statsLine, precise: impactPrecise, pass, reverbNote };
+
+    // Second playback pass: grab the SELECTED frames at full resolution and
+    // attach them, so the sheet/AI paths never seek a paused video either.
+    playbackBufRef.current = null;
+    if (usePlayback) {
+      const finals = await bufferTargetFrames(v, start, end, out.map((f) => f.t));
+      for (let i = 0; i < out.length; i++) out[i].canvas = finals[i].canvas;
+    }
+    try { v.currentTime = resumeT0; } catch {}
     return out;
   };
 
@@ -1450,7 +1575,9 @@ export default function SwingTracer() {
   // download button and the one-tap share action below.
   const buildFrameSheetCanvas = async (frames) => {
     const cells = [];
-    for (const fr of frames) cells.push({ ...fr, canvas: await captureCanvasAt(fr.t) });
+    // fr.canvas is pre-captured via playback (iOS-reliable); only fall back
+    // to a seek-capture if it's missing (very old browser without rVFC).
+    for (const fr of frames) cells.push({ ...fr, canvas: fr.canvas || (await captureCanvasAt(fr.t)) });
 
     const cols = cells.length <= 4 ? 2 : 3;
     const rows = Math.ceil(cells.length / cols);
@@ -1703,7 +1830,10 @@ export default function SwingTracer() {
 
       const shots = [];
       for (const fr of frames) {
-        shots.push({ label: fr.label, b64: await captureFrame(fr.t) });
+        const b64 = fr.canvas
+          ? fr.canvas.toDataURL("image/jpeg", 0.7).split(",")[1]
+          : await captureFrame(fr.t);
+        shots.push({ label: fr.label, b64 });
       }
       v.currentTime = resumeT;
 
