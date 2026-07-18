@@ -356,6 +356,10 @@ export default function SwingTracer() {
 
   const onFile = (e) => {
     const f = e.target.files?.[0];
+    // Allow re-selecting the SAME file (e.g. recording a second swing): the
+    // input fires change only when its value changes, so clear it after we
+    // have the File in hand.
+    e.target.value = "";
     if (!f) return;
     if (src && src.startsWith("blob:")) URL.revokeObjectURL(src);
     fileRef.current = f;
@@ -373,6 +377,16 @@ export default function SwingTracer() {
     setPlaying(false);
     setTime(0);
   };
+
+  // The file input's `capture` attribute opens the phone's native camera
+  // (video mode, including the phone's own slow-mo) instead of the file
+  // picker — but only on mobile. Desktop browsers ignore `capture` and would
+  // show a confusing second file dialog, so the Record button is mobile-only.
+  // iPadOS 13+ reports a desktop UA, so also treat a multi-touch "Mac" as one.
+  const canCapture =
+    typeof navigator !== "undefined" &&
+    (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+      (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)));
 
   const onVideoError = () => {
     const f = fileRef.current;
@@ -2052,7 +2066,7 @@ export default function SwingTracer() {
               <button className="btn small" onClick={() => setShowIntro(false)}>✕</button>
             </div>
             <ol style={{ margin: "8px 0 0", paddingLeft: 18 }}>
-              <li>Load your swing video (down the line or face on).</li>
+              <li>Record a swing with your camera or load an existing video (down the line or face on).</li>
               <li>In <b>✎ Mark start/end</b>, tap the swing-start and swing-end pills at the right frames.</li>
               <li>Optional: draw plane lines, angles, or circles to check yourself against the checkpoints below.</li>
               <li>Head to <b>AI coach</b> to get Claude's read, or download a frame sheet to analyze in a chat.</li>
@@ -2066,10 +2080,24 @@ export default function SwingTracer() {
             <button className={view === "dtl" ? "on" : ""} onClick={() => setView("dtl")}>Down the line</button>
             <button className={view === "fo" ? "on" : ""} onClick={() => setView("fo")}>Face on</button>
           </div>
-          <label className="btn primary" style={{ display: "inline-block" }}>
-            {src ? "Load new video" : "Load video"}
-            <input type="file" accept="video/*" onChange={onFile} style={{ display: "none" }} />
-          </label>
+          <div className="row" style={{ gap: 8 }}>
+            {canCapture && (
+              <label className="btn" style={{ display: "inline-block" }}>
+                🎥 Record
+                <input
+                  type="file"
+                  accept="video/*"
+                  capture="environment"
+                  onChange={onFile}
+                  style={{ display: "none" }}
+                />
+              </label>
+            )}
+            <label className="btn primary" style={{ display: "inline-block" }}>
+              {src ? "Load new video" : "Load video"}
+              <input type="file" accept="video/*" onChange={onFile} style={{ display: "none" }} />
+            </label>
+          </div>
         </div>
 
         {!src && (
@@ -2079,7 +2107,8 @@ export default function SwingTracer() {
             </div>
             <p className="hint" style={{ maxWidth: 420, margin: "8px auto 0" }}>
               Film from down the line (camera at hand height, on the target line) or face on (camera at chest height, square to you).
-              Slow-mo or normal clips from your phone both work great — the frame rate is detected automatically when the clip loads.
+              {canCapture ? " Tap Record to film one now, or Load an existing clip." : ""} Slow-mo or normal clips from your phone
+              both work great — the frame rate is detected automatically when the clip loads.
             </p>
             <p className="hint mono" style={{ marginTop: 10, color: hevcOk ? "var(--green)" : "var(--amber)" }}>
               {hevcOk
