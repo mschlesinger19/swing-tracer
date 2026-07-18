@@ -282,6 +282,172 @@ const lineAngleDeg = (p1, p2, w, h) => {
 };
 
 /* ------------------------------------------------------------------ */
+/* MP4/MOV → ADTS AAC extraction (iOS audio-decode fallback)           */
+/* ------------------------------------------------------------------ */
+// Safari's decodeAudioData refuses to demux audio out of VIDEO containers
+// (.mov/.mp4) — it wants an audio file. Chrome demuxes them happily, which
+// is why the audio impact path always worked in desktop testing yet every
+// on-device export said "no impact click": on iOS the decode silently
+// failed and impact fell back to the (slow-mo-hostile) motion peak. The
+// fallback: parse the container's sample tables ourselves, pull the mp4a
+// track's raw AAC frames out of mdat, and rewrap them as an ADTS stream —
+// which Safari decodes fine (it's a plain .aac file at that point).
+//
+// Returns { adts, offsetS, sampleRate, channels } or null. offsetS maps the
+// decoded stream's clock to the movie clock (movie = decoded + offsetS):
+// iPhone tracks trim ~2112 samples of AAC priming via the edit list, and a
+// mis-set sample rate shifts everything (a 44.1k track wrongly labeled 48k
+// read 8.8% fast — a 0.8s error on a 17s clip — during validation).
+// Validated against 5 real iPhone clips: detector results within ±9ms of
+// container-aware ffmpeg demuxing, identical gate outcomes.
+const extractAdtsAac = (u8) => {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const rd32 = (o) => dv.getUint32(o);
+  const rd64 = (o) => dv.getUint32(o) * 4294967296 + dv.getUint32(o + 4);
+  const boxType = (o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+  const children = (start, end) => {
+    const out = [];
+    let o = start;
+    while (o + 8 <= end) {
+      let size = rd32(o), payload = o + 8;
+      if (size === 1) { size = rd64(o + 8); payload = o + 16; }
+      else if (size === 0) size = end - o;
+      if (size < 8 || o + size > end) break;
+      out.push({ t: boxType(o + 4), o, size, p: payload });
+      o += size;
+    }
+    return out;
+  };
+  const find = (list, t) => list.find((b) => b.t === t);
+
+  const moov = find(children(0, u8.length), 'moov');
+  if (!moov) return null;
+  const moovKids = children(moov.p, moov.o + moov.size);
+  const mvhd = find(moovKids, 'mvhd');
+  const movieTs = mvhd ? rd32(mvhd.p + 12) : 600;
+
+  for (const trak of moovKids.filter((b) => b.t === 'trak')) {
+    const trakKids = children(trak.p, trak.o + trak.size);
+    const mdia = find(trakKids, 'mdia');
+    if (!mdia) continue;
+    const mdiaKids = children(mdia.p, mdia.o + mdia.size);
+    const hdlr = find(mdiaKids, 'hdlr');
+    if (!hdlr || boxType(hdlr.p + 8) !== 'soun') continue;
+    const minf = find(mdiaKids, 'minf');
+    if (!minf) continue;
+    const stbl = find(children(minf.p, minf.o + minf.size), 'stbl');
+    if (!stbl) continue;
+    const stblKids = children(stbl.p, stbl.o + stbl.size);
+    const stsd = find(stblKids, 'stsd');
+    if (!stsd) continue;
+    const mp4a = find(children(stsd.p + 8, stsd.o + stsd.size), 'mp4a');
+    if (!mp4a) continue; // not AAC (e.g. an apac spatial-audio track) — keep looking
+
+    // sample entry: channels @+16, sampleRate as 16.16 fixed @+24; a
+    // QuickTime v1 entry inserts 16 extra bytes (v2: 36) before the
+    // extension boxes, so locate esds accordingly
+    let channels = dv.getUint16(mp4a.p + 16);
+    let sampleRate = dv.getUint32(mp4a.p + 24) >>> 16;
+    let objectType = 2; // AAC-LC
+    const FREQS = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    const stsdVer = dv.getUint16(mp4a.p + 8);
+    const extOff = mp4a.p + 28 + (stsdVer === 1 ? 16 : stsdVer === 2 ? 36 : 0);
+    const esds = find(children(extOff, mp4a.o + mp4a.size), 'esds');
+    if (esds) {
+      // descriptor tree: ES(0x03) → DecoderConfig(0x04) → AudioSpecificConfig(0x05)
+      let o = esds.p + 4;
+      const end = esds.o + esds.size;
+      while (o < end) {
+        const tag = u8[o++];
+        let len = 0, b;
+        do { b = u8[o++]; len = (len << 7) | (b & 0x7f); } while (b & 0x80);
+        if (tag === 0x03) { o += 3; continue; }
+        if (tag === 0x04) { o += 13; continue; }
+        if (tag === 0x05) {
+          const b0 = u8[o], b1 = u8[o + 1];
+          objectType = (b0 >> 3) & 0x1f;
+          const fi = ((b0 & 7) << 1) | (b1 >> 7);
+          if (fi < 13) sampleRate = FREQS[fi];
+          channels = (b1 >> 3) & 0xf;
+          break;
+        }
+        o += len;
+      }
+    }
+    let freqIdx = FREQS.indexOf(sampleRate);
+    if (freqIdx === -1) freqIdx = 3; // 48k — the iPhone default
+    if (objectType < 1 || objectType > 4) objectType = 2;
+    const chanCfg = Math.min(Math.max(channels, 1), 7);
+
+    const stsz = find(stblKids, 'stsz');
+    const stsc = find(stblKids, 'stsc');
+    const stco = find(stblKids, 'stco') || find(stblKids, 'co64');
+    if (!stsz || !stsc || !stco) return null;
+    const uniform = rd32(stsz.p + 4);
+    const sampleCount = rd32(stsz.p + 8);
+    const sizeOf = (i) => (uniform ? uniform : rd32(stsz.p + 12 + i * 4));
+    const chunkCount = rd32(stco.p + 4);
+    const co64 = stco.t === 'co64';
+    const chunkOff = (i) => (co64 ? rd64(stco.p + 8 + i * 8) : rd32(stco.p + 8 + i * 4));
+    const stscN = rd32(stsc.p + 4);
+    const stscEntry = (i) => ({
+      firstChunk: rd32(stsc.p + 8 + i * 12),
+      perChunk: rd32(stsc.p + 12 + i * 12),
+    });
+
+    let total = 0;
+    for (let i = 0; i < sampleCount; i++) total += sizeOf(i) + 7;
+    const out = new Uint8Array(total);
+    let w = 0, s = 0;
+    for (let e = 0; e < stscN && s < sampleCount; e++) {
+      const cur = stscEntry(e);
+      const nextFirst = e + 1 < stscN ? stscEntry(e + 1).firstChunk : chunkCount + 1;
+      for (let c = cur.firstChunk; c < nextFirst && s < sampleCount; c++) {
+        let off = chunkOff(c - 1);
+        for (let k = 0; k < cur.perChunk && s < sampleCount; k++, s++) {
+          const sz = sizeOf(s);
+          const fl = sz + 7; // ADTS header + payload
+          out[w] = 0xff;
+          out[w + 1] = 0xf1;
+          out[w + 2] = ((objectType - 1) << 6) | (freqIdx << 2) | (chanCfg >> 2);
+          out[w + 3] = ((chanCfg & 3) << 6) | (fl >> 11);
+          out[w + 4] = (fl >> 3) & 0xff;
+          out[w + 5] = ((fl & 7) << 5) | 0x1f;
+          out[w + 6] = 0xfc;
+          out.set(u8.subarray(off, off + sz), w + 7);
+          w += fl;
+          off += sz;
+        }
+      }
+    }
+    if (s === 0) return null;
+
+    // timeline offset: an initial empty edit (media_time −1) delays the
+    // track; a positive media_time trims the head (AAC priming)
+    let offsetS = 0;
+    const mdhd = find(mdiaKids, 'mdhd');
+    const mediaTs = mdhd ? rd32(mdhd.p + 12) : sampleRate;
+    const edts = find(trakKids, 'edts');
+    const elst = edts ? find(children(edts.p, edts.o + edts.size), 'elst') : null;
+    if (elst) {
+      const ver = u8[elst.p];
+      const nEd = rd32(elst.p + 4);
+      let o = elst.p + 8;
+      for (let i = 0; i < nEd; i++) {
+        let segDur, mediaTime;
+        if (ver === 1) { segDur = rd64(o); mediaTime = Number(dv.getBigInt64(o + 8)); o += 20; }
+        else { segDur = rd32(o); mediaTime = dv.getInt32(o + 4); o += 12; }
+        if (mediaTime === -1) { offsetS += segDur / movieTs; continue; }
+        offsetS -= mediaTime / mediaTs;
+        break; // only the first presented edit places the stream start
+      }
+    }
+    return { adts: out.subarray(0, w), offsetS, sampleRate, channels: chanCfg };
+  }
+  return null;
+};
+
+/* ------------------------------------------------------------------ */
 /* Main component                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -1018,10 +1184,34 @@ export default function SwingTracer() {
       const f = fileRef.current;
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!f || !AC) return null;
+      const data = await f.arrayBuffer();
       const ac = new AC();
-      let buf;
+      let buf = null;
+      let tShift = 0; // decoded-stream clock → movie clock
       try {
-        buf = await ac.decodeAudioData(await f.arrayBuffer());
+        // direct decode works where the browser demuxes video containers
+        // (Chrome, Firefox). decodeAudioData detaches its input, so hand it
+        // a copy and keep `data` for the fallback.
+        try {
+          buf = await ac.decodeAudioData(data.slice(0));
+        } catch {
+          buf = null;
+        }
+        if (!buf || !buf.length) {
+          // Safari/iOS path: extract the AAC track ourselves and decode it
+          // as a bare ADTS stream (see extractAdtsAac)
+          const ex = extractAdtsAac(new Uint8Array(data));
+          if (ex) {
+            const bytes = new Uint8Array(ex.adts); // standalone copy — decode detaches it
+            try {
+              buf = await ac.decodeAudioData(bytes.buffer);
+              tShift = ex.offsetS;
+              console.info(`[frames] audio via ADTS extraction (${ex.sampleRate}Hz, offset ${ex.offsetS.toFixed(3)}s)`);
+            } catch {
+              buf = null;
+            }
+          }
+        }
       } finally {
         ac.close?.();
       }
@@ -1042,10 +1232,10 @@ export default function SwingTracer() {
         for (let j = 0; j < win; j++) { const v = hp[o + j]; e += v * v; }
         rms[i] = Math.sqrt(e / win);
       }
-      const tOf = (i) => (i * hop) / sr;
-      // 3. restrict everything to the marked swing window
-      const i0 = Math.max(0, Math.ceil(start / (hop / sr)));
-      const i1 = Math.min(n - 1, Math.floor(end / (hop / sr)));
+      const tOf = (i) => (i * hop) / sr + tShift;
+      // 3. restrict everything to the marked swing window (movie clock)
+      const i0 = Math.max(0, Math.ceil((start - tShift) / (hop / sr)));
+      const i1 = Math.min(n - 1, Math.floor((end - tShift) / (hop / sr)));
       if (i1 < i0) return null;
       // 4. peak + dominance stats within the window
       const wr = [];

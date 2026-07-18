@@ -88,8 +88,49 @@ Regression entry for this clip: assert hp2k peak within ±2 frames of 6.525 s;
 assert gate outcome UNCONFIRMED; assert the ball-departure check reports no-ball
 rather than a false positive.
 
+## Addendum 2 (2026-07-18): IMG_1259.mov — patio slo-mo + the iOS decode gap
+
+1080×1920, 30 fps (slo-mo export), 14.53 s, AAC stereo + APAC spatial track.
+
+**Why this clip is here:** it exposed that the audio path had never actually
+run on-device. Safari's `decodeAudioData` refuses to demux audio from video
+containers (.mov/.mp4) — Chrome demuxes them, so every desktop/headless test
+passed while every iPhone export silently lost audio and fell back to the
+motion peak (which slow-motion turns into noise; this clip's sheet anchored
+"impact" on a finish-hold frame at 13.62 s and spent 9 of 18 frames on the
+finish). Fixed in the app by extracting the mp4a track's frames from the
+container and re-wrapping them as ADTS, which Safari accepts. The extractor
+was validated against ffmpeg's container-aware demux on all 5 clips: detector
+results within ±9 ms, identical gate outcomes. Two traps worth recording:
+
+- The mp4a sample-entry `sampleRate` lives at offset +24 (16.16 fixed). A
+  mis-read that defaulted to 48 kHz made the two 44.1 kHz tracks (IMG_5150,
+  IMG_6774) decode 8.8% fast — a −805 ms impact error on a 17 s clip.
+- The edit list trims ~2112 samples of AAC priming (~44 ms); the decoded
+  ADTS stream must be shifted by the elst offset to sit on the movie clock.
+
+**Impact reference:**
+
+| evidence | t | note |
+|----------|---|------|
+| ball-departure (visual, certified) | n254 → n255, ≈8.47–8.50 s | ball on mat with clubhead arriving at n254; airborne at n255 |
+| hp2k audio click | 8.630 s (onset 8.618 s) | sharp, clean, from silence; 68×/16.8× in window 4.78–13.62 s → CONFIRMED |
+
+The ~+0.15 s disagreement is an **audio-vs-video retiming offset in the
+slo-mo export itself** (Apple applies separate retime curves; the click is
+not stretched, just placed late). No audio-only detector can correct this.
+Consequence: on slo-mo exports the ★ impact marker may sit a few frames after
+true contact; the dense pre-impact window (impact−0.35 s) still captures the
+true-contact frame. The regression case for this clip asserts the
+**audio-stream** truth (8.630 s), which is what the detector can and must
+find.
+
+Also reconfirmed on this clip: window restriction is load-bearing — clip-end
+handling noise (13.9/14.3 s) outside the marked swing drops dominance from
+16.8× to 1.9× if the search isn't windowed.
+
 ---
 
-*Ground truth established 2026-07-17. These numbers are physical truth, not
-calibration targets — do not loosen the test tolerances in
-`test_detect_impact.py` to make a future change pass.*
+*Ground truth established 2026-07-17 (addenda 2026-07-18). These numbers are
+physical truth, not calibration targets — do not loosen the test tolerances
+in `test_detect_impact.py` to make a future change pass.*

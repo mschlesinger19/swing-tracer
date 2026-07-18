@@ -21,6 +21,15 @@ CASES = [
     ("IMG_5150.wav", (None, None), 2.117, 1.5 * FPS30, True),
     ("IMG_6774.wav", (8.5, 13.0), 10.450, 1.5 * FPS30, True),   # unclipped source: window required
     ("IMG_0687.wav", (5.0, 8.5), 6.525, 2.5 * FPS30, False),    # garage: must stay unconfirmed
+    # IMG_1259 (patio slo-mo, added 2026-07-18): truth here is the click's
+    # position IN THE AUDIO STREAM (8.630s, sharp onset from silence). The
+    # visually certified ball-departure is n254 (~8.47s) — this slo-mo
+    # export carries a ~+0.15s audio-vs-video retiming offset that no audio
+    # detector can see. The detector's job is the audio; the A/V offset is
+    # documented in ground-truth-impacts.md. Also: window (4.78, 13.62) is
+    # required — end-of-clip handling noise at 13.9/14.3s otherwise drops
+    # next-transient dominance to 1.9x and demotes a decisive strike.
+    ("IMG_1259.wav", (4.78, 13.62), 8.630, 1.5 * FPS30, True),
 ]
 
 
