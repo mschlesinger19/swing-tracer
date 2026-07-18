@@ -965,19 +965,54 @@ export default function SwingTracer() {
   };
 
   // Detect the impact CLICK in the clip's audio track. This is the primary
-  // impact refiner: the strike is a broadband transient that dwarfs the
-  // range's ambient high-frequency energy — measured 69× and 408× the clip
-  // median on two real clips, landing within one frame of the visually
-  // confirmed impact on both. Every pixel heuristic tried before this
+  // impact refiner: the strike is a broadband/high-frequency transient that
+  // dwarfs the range's ambient energy, landing within one frame of the
+  // visually confirmed impact. Every pixel heuristic tried before this
   // failed a real clip: at analysis resolution the ball is 2–6px and sits
   // against the clubhead at address, so static-early/changed-late ROI
   // scoring latches onto body/shadow relocation instead (the golfer's legs
   // fired 0.23s early on one clip; a club shadow 0.55s late on another).
-  // First-difference of the waveform ≈ high-pass filter; 10ms RMS windows;
-  // returns the onset of the strongest transient inside the marked bounds
-  // plus how decisively it wins, for the caller's trust gates. Returns
-  // null (caller falls back to pixels) for muted clips, missing WebAudio,
-  // or undecodable audio codecs.
+  //
+  // Algorithm validated against 4 ground-truth clips (audio/ground-truth-
+  // impacts.md; reference impl audio/detect_impact.py, regression
+  // audio/test_detect_impact.py). The one change that mattered: a 2kHz
+  // 4th-order Butterworth high-pass BEFORE the RMS envelope. The click is
+  // high-frequency; swing whoosh, reverb tails and net/floor thuds are
+  // low-frequency. Without it the raw envelope still peaked on the right
+  // frame but the dominance gate demoted all 3 confirmable clips (whoosh and
+  // rumble inflate the ambient and next-transient measurements), and a
+  // reverberant garage clip peaked ~10 frames late. With it, all prior
+  // CONFIRMED clips stay confirmed with far larger margins, and the garage
+  // clip peaks frame-exact while still (correctly) failing the gate. The
+  // gate thresholds (≥20× ambient AND ≥5× next transient) were never the
+  // problem and are unchanged. Ported bit-for-bit from the scipy reference
+  // (RBJ high-pass biquad cascade ≡ scipy butter+sosfilt for this purpose;
+  // verified identical dominance stats and gate outcomes at 16k and 48k).
+  //
+  // Returns { t, ratio, dominance } — the PEAK time (the strike itself; the
+  // high-pass removes the swoosh that used to force an onset walk-back),
+  // peak/median-ambient, and peak/next-transient — for the caller's trust
+  // gates. Returns null (caller falls back to pixels) for muted clips,
+  // missing WebAudio, or undecodable audio codecs.
+  const HP_CUTOFF_HZ = 2000;
+  // 4th-order Butterworth = two RBJ high-pass biquads at these Q values.
+  const BUTTER_Q = [0.5411961, 1.3065630];
+  const hpBiquad = (x, f0, fs, Q) => {
+    const w0 = (2 * Math.PI * f0) / fs;
+    const c = Math.cos(w0), s = Math.sin(w0), alpha = s / (2 * Q);
+    const a0 = 1 + alpha;
+    const b0 = ((1 + c) / 2) / a0, b1 = (-(1 + c)) / a0, b2 = b0;
+    const a1 = (-2 * c) / a0, a2 = (1 - alpha) / a0;
+    const y = new Float64Array(x.length);
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < x.length; i++) {
+      const xi = x[i];
+      const yi = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = xi; y2 = y1; y1 = yi;
+      y[i] = yi;
+    }
+    return y;
+  };
   const detectImpactClick = async (start, end) => {
     try {
       const f = fileRef.current;
@@ -991,47 +1026,43 @@ export default function SwingTracer() {
         ac.close?.();
       }
       if (!buf || !buf.length) return null;
-      const ch = buf.getChannelData(0);
-      const win = Math.max(16, Math.round(buf.sampleRate * 0.01)); // 10ms
-      const n = Math.floor((ch.length - 1) / win);
+      const sr = buf.sampleRate;
+      // 1. high-pass: isolate the strike click from whoosh/reverb/thud energy
+      let hp = Float64Array.from(buf.getChannelData(0));
+      for (const Q of BUTTER_Q) hp = hpBiquad(hp, HP_CUTOFF_HZ, sr, Q);
+      // 2. short-window RMS envelope (5ms hop, 10ms window; overlapping)
+      const hop = Math.max(1, Math.round(sr * 0.005));
+      const win = Math.max(2, Math.round(sr * 0.01));
+      const n = Math.floor((hp.length - win) / hop);
       if (n < 20) return null;
       const rms = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         let e = 0;
-        const o = i * win;
-        for (let j = o + 1; j <= o + win; j++) {
-          const d = ch[j] - ch[j - 1];
-          e += d * d;
-        }
+        const o = i * hop;
+        for (let j = 0; j < win; j++) { const v = hp[o + j]; e += v * v; }
         rms[i] = Math.sqrt(e / win);
       }
-      const sorted = [...rms].sort((a, b) => a - b);
-      const med = sorted[Math.floor(n / 2)] || 1e-9;
-      const i0 = Math.max(0, Math.floor(start / 0.01));
-      const i1 = Math.min(n - 1, Math.ceil(end / 0.01));
-      let peakI = -1;
-      for (let i = i0; i <= i1; i++) if (peakI === -1 || rms[i] > rms[peakI]) peakI = i;
-      if (peakI === -1) return null;
-      // onset: walk back from the peak only while energy stays ≥25% of the
-      // peak. Do NOT chase the ambient floor: the pre-impact downswing
-      // swoosh clears ambient ~0.3-0.5s before contact, so an
-      // ambient-relative leading edge lands well before the strike (measured
-      // on a face-on slow-mo net clip: ground-truth club-ball contact at
-      // ~10.12s, but the swoosh ramp rises above 4× median by 9.72s — a
-      // 0.4s error). The 25%-of-peak floor stays on the loud crack itself;
-      // on a clean click the peak already is the onset (<1 frame apart), and
-      // on a reverberant/stretched strike it holds near the peak (~0.15s
-      // after contact) rather than running early down the swoosh.
-      let onI = peakI;
-      while (onI > i0 && rms[onI - 1] >= 0.25 * rms[peakI]) onI--;
-      // dominance: the next-strongest transient ≥0.3s away. Reverberant or
-      // slow-mo-stretched strikes score low here (a sustained blob keeps the
-      // tail loud); clean clicks score very high. The caller gates trust on
-      // it — and the dense window reaching impact−0.35s means even a
-      // reverb-late anchor still captures the true-impact frame.
-      let second = 0;
-      for (let i = i0; i <= i1; i++) if (Math.abs(i - peakI) > 30) second = Math.max(second, rms[i]);
-      return { t: onI * 0.01, ratio: rms[peakI] / med, dominance: rms[peakI] / (second || 1e-9) };
+      const tOf = (i) => (i * hop) / sr;
+      // 3. restrict everything to the marked swing window
+      const i0 = Math.max(0, Math.ceil(start / (hop / sr)));
+      const i1 = Math.min(n - 1, Math.floor(end / (hop / sr)));
+      if (i1 < i0) return null;
+      // 4. peak + dominance stats within the window
+      const wr = [];
+      for (let i = i0; i <= i1; i++) wr.push(rms[i]);
+      wr.sort((a, b) => a - b);
+      const ambient = Math.max(wr[Math.floor(wr.length / 2)], 1e-9);
+      let peakI = i0;
+      for (let i = i0; i <= i1; i++) if (rms[i] > rms[peakI]) peakI = i;
+      const peakT = tOf(peakI), peakV = rms[peakI];
+      // next transient: asymmetric exclusion (−50ms/+300ms) — reverb and
+      // secondary impacts trail the strike, they never precede it
+      let next = 1e-9;
+      for (let i = i0; i <= i1; i++) {
+        const ti = tOf(i);
+        if (ti < peakT - 0.05 || ti > peakT + 0.3) next = Math.max(next, rms[i]);
+      }
+      return { t: peakT, ratio: peakV / ambient, dominance: peakV / next };
     } catch {
       return null;
     }

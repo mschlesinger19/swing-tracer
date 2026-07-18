@@ -1,0 +1,32 @@
+name: Audio impact detector tests
+
+# Regression guard for the audio impact detector. The four cases in
+# audio/test_detect_impact.py are physical ground truth (see
+# audio/ground-truth-impacts.md); their tolerances must not be loosened to
+# make a change pass. The JS detector in src/App.jsx is a verified port of
+# audio/detect_impact.py — keep them in sync when either changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "audio/**"
+      - ".github/workflows/audio-impact-tests.yml"
+  pull_request:
+    paths:
+      - "audio/**"
+      - ".github/workflows/audio-impact-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy scipy
+      - name: Run ground-truth impact regression
+        working-directory: audio
+        run: python test_detect_impact.py
