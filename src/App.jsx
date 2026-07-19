@@ -464,6 +464,18 @@ export default function SwingTracer() {
   const [fps, setFps] = useState(60);
   const [fpsSource, setFpsSource] = useState("default"); // default | detected | manual
   const [view, setView] = useState("dtl");
+  // Handedness is user-declared, not detected: in the down-the-line view a
+  // lefty filmed from one side of the target line is nearly indistinguishable
+  // from a righty filmed from the other, so any pixel guess would sometimes
+  // silently mislead the analysis — worse than asking. Persisted; a golfer's
+  // handedness doesn't change between sessions.
+  const [handed, setHanded] = useState(() => {
+    try { return localStorage.getItem("swing-tracer-handed") === "left" ? "left" : "right"; } catch { return "right"; }
+  });
+  const setHandedPersist = (h) => {
+    setHanded(h);
+    try { localStorage.setItem("swing-tracer-handed", h); } catch {}
+  };
   const [tool, setTool] = useState("off");
   const [color, setColor] = useState(DRAW_COLORS[0]);
   const [shapes, setShapes] = useState([]);
@@ -1890,7 +1902,7 @@ export default function SwingTracer() {
     ctx.fillStyle = "#8FA096";
     ctx.font = "600 16px ui-monospace, Menlo, monospace";
     ctx.fillText(
-      `${view === "dtl" ? "Down the line" : "Face on"} · ${fps}fps · ${cells.length} frames`,
+      `${view === "dtl" ? "Down the line" : "Face on"} · ${handed === "left" ? "left-handed" : "right-handed"} golfer · ${fps}fps · ${cells.length} frames`,
       pad + 2,
       20
     );
@@ -1930,6 +1942,8 @@ export default function SwingTracer() {
     const lines = [
       `I'm attaching a frame sheet from one of my golf swings, filmed ${
         view === "dtl" ? "down the line (camera behind the hands, looking at the target)" : "face on (camera facing my chest)"
+      }. I'm a ${handed === "left" ? "LEFT-handed" : "right-handed"} golfer${
+        handed === "left" ? " — mirror all positional reads (lead side is my right side)" : ""
       }. Frames read left to right, top to bottom, in swing order.`,
       `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
       `The clip is ${fps}fps, ${fmt(duration)} long.`,
@@ -2122,7 +2136,9 @@ export default function SwingTracer() {
       content.push({
         type: "text",
         text:
-          `You are an expert golf instructor. These frames are from one swing filmed ${viewName}, in chronological order with approximate labels — go by what's actually visible in each frame rather than trusting the label precisely. ` +
+          `You are an expert golf instructor. These frames are from one swing by a ${
+            handed === "left" ? "LEFT-handed golfer (mirror all positional reads: the lead side is their right side)" : "right-handed golfer"
+          }, filmed ${viewName}, in chronological order with approximate labels — go by what's actually visible in each frame rather than trusting the label precisely. ` +
           `Analyze the swing. Be specific and reference what is visible (shaft direction, spine angle, hip depth, head position, weight, arm structure). ` +
           `Fault catalog for this camera angle: ${faultCatalog}. ` +
           `Respond with ONLY valid JSON, no markdown, no preamble, exactly this shape: ` +
@@ -2250,11 +2266,17 @@ export default function SwingTracer() {
           </div>
         )}
 
-        {/* view + upload */}
+        {/* view + handedness + upload */}
         <div className="row" style={{ marginTop: 12, justifyContent: "space-between" }}>
-          <div className="seg">
-            <button className={view === "dtl" ? "on" : ""} onClick={() => setView("dtl")}>Down the line</button>
-            <button className={view === "fo" ? "on" : ""} onClick={() => setView("fo")}>Face on</button>
+          <div className="row" style={{ gap: 8 }}>
+            <div className="seg">
+              <button className={view === "dtl" ? "on" : ""} onClick={() => setView("dtl")}>Down the line</button>
+              <button className={view === "fo" ? "on" : ""} onClick={() => setView("fo")}>Face on</button>
+            </div>
+            <div className="seg" title="Included in every analysis so the coach reads your positions correctly">
+              <button className={handed === "right" ? "on" : ""} onClick={() => setHandedPersist("right")}>Righty</button>
+              <button className={handed === "left" ? "on" : ""} onClick={() => setHandedPersist("left")}>Lefty</button>
+            </div>
           </div>
           <label className="btn primary" style={{ display: "inline-block" }}>
             {src ? "Load new video" : "Load video"}
