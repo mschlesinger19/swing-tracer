@@ -2525,6 +2525,21 @@ export default function SwingTracer() {
         {tab === "ai" && (
           <>
             <div className="card">
+              <h4>What are you working on? <span className="hint" style={{ fontWeight: 400 }}>(optional)</span></h4>
+              <p className="hint" style={{ marginTop: 2, marginBottom: 8 }}>
+                A feel you're chasing, a miss you keep fighting, a swing thought — whatever you add here is
+                sent with the analysis below and included in the copied chat prompt, so Claude's read is
+                tailored to you.
+              </p>
+              <textarea
+                placeholder="e.g. Fighting a slice off the tee. Working on staying connected in the takeaway. My miss is right when I get quick from the top."
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+              <p className="hint" style={{ marginTop: 6 }}>Shared with your Session plan notes.</p>
+            </div>
+
+            <div className="card">
               <h4>Claude swing analysis</h4>
               <p>
                 Captures key frames from your clip and sends them to Claude for a coaching read.
@@ -2692,7 +2707,8 @@ export default function SwingTracer() {
                 <button className="btn" onClick={copySummary}>Copy plan to clipboard</button>
               </div>
               <p className="hint" style={{ marginTop: 6 }}>
-                Notes live in this session only — copy the plan out before you close the tab.
+                Shared with the AI coach tab — Claude sees these too. Notes live in this session only,
+                so copy the plan out before you close the tab.
               </p>
             </div>
           </>
