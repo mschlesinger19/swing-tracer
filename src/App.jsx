@@ -251,6 +251,13 @@ const SPEEDS = [0.1, 0.25, 0.5, 1, 2];
 const FPS_OPTIONS = [30, 60, 120, 240];
 const DRAW_COLORS = ["#FF5A36", "#EDF2EA", "#55C97B", "#4DA3FF"];
 
+// The direct "Analyze this swing" path needs the user's own Anthropic API key,
+// which we're deferring. Until it ships, hide everything that path drives (the
+// analyze card, its result/error cards, and the Settings key field) so the
+// only analysis route is the keyless chat share/export. Flip to true to bring
+// it all back.
+const DIRECT_API_ENABLED = false;
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -2261,7 +2268,7 @@ export default function SwingTracer() {
               <li>Load your swing video (down the line or face on).</li>
               <li>In <b>✎ Mark start/end</b>, tap the swing-start and swing-end pills at the right frames.</li>
               <li>Optional: draw plane lines, angles, or circles to check yourself against the checkpoints below.</li>
-              <li>Head to <b>AI coach</b> to get Claude's read, or download a frame sheet to analyze in a chat.</li>
+              <li>Head to <b>AI coach</b> to share your swing to a Claude chat for a coaching read (add what you're working on so the read is tailored to you).</li>
             </ol>
           </div>
         )}
@@ -2473,7 +2480,9 @@ export default function SwingTracer() {
           <button className={tab === "plan" ? "on" : ""} onClick={() => setTab("plan")}>
             Session plan{allFlagged.length ? ` (${allFlagged.length})` : ""}
           </button>
-          <button className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>Settings</button>
+          {DIRECT_API_ENABLED && (
+            <button className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>Settings</button>
+          )}
         </div>
 
         {tab === "mechanics" && (
@@ -2539,49 +2548,51 @@ export default function SwingTracer() {
               <p className="hint" style={{ marginTop: 6 }}>Shared with your Session plan notes.</p>
             </div>
 
-            <div className="card">
-              <h4>Claude swing analysis</h4>
-              <p>
-                Captures key frames from your clip and sends them to Claude for a coaching read.
-                Mark your swing start and end first for the best sampling — Claude then sees frames
-                spanning the actual swing instead of guesses across the whole clip. Detected faults
-                are auto-flagged into your session plan with their drills.
-              </p>
-              {!apiKey && (
-                <p className="hint" style={{ marginTop: 6, color: "var(--amber)" }}>
-                  No API key set — add one in the{" "}
-                  <span style={{ textDecoration: "underline", cursor: "pointer" }} onClick={() => setTab("settings")}>
-                    Settings
-                  </span>{" "}
-                  tab first.
+            {DIRECT_API_ENABLED && (
+              <div className="card">
+                <h4>Claude swing analysis</h4>
+                <p>
+                  Captures key frames from your clip and sends them to Claude for a coaching read.
+                  Mark your swing start and end first for the best sampling — Claude then sees frames
+                  spanning the actual swing instead of guesses across the whole clip. Detected faults
+                  are auto-flagged into your session plan with their drills.
                 </p>
-              )}
-              <div className="row" style={{ marginTop: 10 }}>
-                <button
-                  className="btn primary"
-                  onClick={runAnalysis}
-                  disabled={!src || !duration || !apiKey || aiState === "capturing" || aiState === "analyzing"}
-                >
-                  {aiState === "capturing"
-                    ? "Capturing frames…"
-                    : aiState === "analyzing"
-                    ? "Claude is analyzing…"
-                    : "Analyze this swing"}
-                </button>
-                <span className="hint">
-                  {markers.p1 != null && markers.p10 != null
-                    ? "Using your marked swing start/end"
-                    : "Swing start/end not marked — will sample across the whole clip"}
-                </span>
+                {!apiKey && (
+                  <p className="hint" style={{ marginTop: 6, color: "var(--amber)" }}>
+                    No API key set — add one in the{" "}
+                    <span style={{ textDecoration: "underline", cursor: "pointer" }} onClick={() => setTab("settings")}>
+                      Settings
+                    </span>{" "}
+                    tab first.
+                  </p>
+                )}
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button
+                    className="btn primary"
+                    onClick={runAnalysis}
+                    disabled={!src || !duration || !apiKey || aiState === "capturing" || aiState === "analyzing"}
+                  >
+                    {aiState === "capturing"
+                      ? "Capturing frames…"
+                      : aiState === "analyzing"
+                      ? "Claude is analyzing…"
+                      : "Analyze this swing"}
+                  </button>
+                  <span className="hint">
+                    {markers.p1 != null && markers.p10 != null
+                      ? "Using your marked swing start/end"
+                      : "Swing start/end not marked — will sample across the whole clip"}
+                  </span>
+                </div>
               </div>
-            </div>
+            )}
 
             <div className="card">
-              <h4>No API key? Analyze in a chat</h4>
+              <h4>{DIRECT_API_ENABLED ? "No API key? Analyze in a chat" : "Analyze your swing in a Claude chat"}</h4>
               <p>
                 Download a frame sheet spanning your swing, then in a Claude chat: attach the image
-                and paste the copied prompt. Same analysis, no key needed — the prompt includes
-                your camera angle, flagged faults, and notes.
+                and paste the copied prompt. The prompt includes your camera angle, handedness,
+                flagged faults, and notes.
               </p>
               {typeof navigator !== "undefined" && navigator.share && (
                 <>
@@ -2624,14 +2635,14 @@ export default function SwingTracer() {
               </div>
             </div>
 
-            {aiState === "error" && (
+            {DIRECT_API_ENABLED && aiState === "error" && (
               <div className="card" style={{ borderColor: "var(--tracer)" }}>
                 <h4 style={{ color: "var(--tracer)" }}>Analysis failed</h4>
                 <p>{aiError} — if this mentions parsing, just run it again; if it mentions the network, wait a moment and retry.</p>
               </div>
             )}
 
-            {aiResult && aiState === "done" && (
+            {DIRECT_API_ENABLED && aiResult && aiState === "done" && (
               <>
                 <div className="card">
                   <h4 style={{ color: "var(--green)" }}>Overall read</h4>
@@ -2714,7 +2725,7 @@ export default function SwingTracer() {
           </>
         )}
 
-        {tab === "settings" && (
+        {DIRECT_API_ENABLED && tab === "settings" && (
           <div className="card" style={{ marginTop: 10 }}>
             <h4>Anthropic API key</h4>
             <p>
