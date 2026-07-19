@@ -488,6 +488,11 @@ export default function SwingTracer() {
   const [shapes, setShapes] = useState([]);
   const [draft, setDraft] = useState(null);
   const [anglePts, setAnglePts] = useState([]);
+  // When set, the reference lines/angles/circles you've drawn are baked onto
+  // every frame of the exported sheet (they're normalized coordinates, so
+  // they overlay each frame as a fixed reference). Only touches sheet
+  // rendering — the frame selection pipeline is unaffected.
+  const [bakeMarkup, setBakeMarkup] = useState(true);
   const [markers, setMarkers] = useState({});
   const [markMode, setMarkMode] = useState(false);
   const [loop, setLoop] = useState(false);
@@ -1913,10 +1918,24 @@ export default function SwingTracer() {
       pad + 2,
       20
     );
+    // Reference markup overlaid on every frame (clipped to the tile so a
+    // line running past the frame edge can't bleed into a neighbor). Line
+    // weight scales cell-vs-stage so it matches what you drew on screen.
+    const overlayMarkup = bakeMarkup && shapes.length > 0;
+    const markScale = cw / (stageSize.w || cw);
     cells.forEach((cell, i) => {
       const cx = pad + (i % cols) * (cw + pad);
       const cy = headerH + pad + Math.floor(i / cols) * (ch + labelH + pad);
       ctx.drawImage(cell.canvas, cx, cy);
+      if (overlayMarkup) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(cx, cy, cw, ch);
+        ctx.clip();
+        ctx.translate(cx, cy);
+        shapes.forEach((s) => drawShape(ctx, s, cw, ch, markScale));
+        ctx.restore();
+      }
       // short label, clipped to its own tile so it can never overstrike a
       // neighbor; the footer carries the long annotation
       ctx.save();
@@ -1953,6 +1972,9 @@ export default function SwingTracer() {
         handed === "left" ? " — mirror all positional reads (lead side is my right side)" : ""
       }. Frames read left to right, top to bottom, in swing order.`,
       `Each frame is labeled: ${frames.map((f) => f.label).join(", ")}. Labels are approximate — go by what's actually visible in each frame, not the label.`,
+      ...(bakeMarkup && shapes.length > 0
+        ? [`The colored lines, angles, and circles on the frames are reference markups I drew (e.g. swing-plane lines, spine/shaft angles) — read the swing against them.`]
+        : []),
       `The clip is ${fps}fps, ${fmt(duration)} long.`,
       ...(impactFrame
         ? [`Motion-based impact estimate: ${fmt(impactFrame.t)} (confidence: ${impactFrame.impactConfidence}) — treat this as a hint, not ground truth.`]
@@ -2633,6 +2655,17 @@ export default function SwingTracer() {
                     : "2 · Copy chat prompt"}
                 </button>
               </div>
+              {shapes.length > 0 && (
+                <label
+                  className="row"
+                  style={{ marginTop: 10, gap: 8, cursor: "pointer", alignItems: "center" }}
+                >
+                  <input type="checkbox" checked={bakeMarkup} onChange={(e) => setBakeMarkup(e.target.checked)} />
+                  <span className="hint" style={{ margin: 0 }}>
+                    Bake my {shapes.length} drawn {shapes.length === 1 ? "markup" : "markups"} (lines/angles/circles) onto every frame
+                  </span>
+                </label>
+              )}
             </div>
 
             {DIRECT_API_ENABLED && aiState === "error" && (
